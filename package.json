@@ -1,0 +1,112 @@
+{
+  "name": "diffspark",
+  "displayName": "DiffSpark",
+  "description": "Smarter reviews. Better code. Review Bitbucket Cloud pull requests from VS Code.",
+  "version": "0.1.0",
+  "publisher": "thiagopsnfg",
+  "icon": "resources/diffspark-icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Source Control"
+  ],
+  "keywords": [
+    "bitbucket",
+    "pull request",
+    "review"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:bitbucketPrReviewer.pullRequests"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "bitbucketPrReviewer",
+          "title": "DiffSpark",
+          "icon": "resources/diffspark-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "bitbucketPrReviewer": [
+        {
+          "id": "bitbucketPrReviewer.pullRequests",
+          "name": "Pull Requests"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "bitbucketPrReviewer.connect",
+        "title": "DiffSpark: Connect"
+      },
+      {
+        "command": "bitbucketPrReviewer.refresh",
+        "title": "DiffSpark: Refresh"
+      },
+      {
+        "command": "bitbucketPrReviewer.selectRepository",
+        "title": "DiffSpark: Select Repository"
+      },
+      {
+        "command": "bitbucketPrReviewer.filterPullRequests",
+        "title": "DiffSpark: Filter Pull Requests"
+      },
+      {
+        "command": "bitbucketPrReviewer.sortPullRequests",
+        "title": "DiffSpark: Sort Pull Requests"
+      },
+      {
+        "command": "bitbucketPrReviewer.openPullRequest",
+        "title": "DiffSpark: Open Pull Request"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "bitbucketPrReviewer.refresh",
+          "when": "view == bitbucketPrReviewer.pullRequests",
+          "group": "navigation"
+        },
+        {
+          "command": "bitbucketPrReviewer.filterPullRequests",
+          "when": "view == bitbucketPrReviewer.pullRequests",
+          "group": "navigation"
+        },
+        {
+          "command": "bitbucketPrReviewer.sortPullRequests",
+          "when": "view == bitbucketPrReviewer.pullRequests",
+          "group": "navigation"
+        },
+        {
+          "command": "bitbucketPrReviewer.selectRepository",
+          "when": "view == bitbucketPrReviewer.pullRequests",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node --test test/*.test.js",
+    "test:coverage": "npm run compile && c8 --include='dist/bitbucket/**/*.js' --include='dist/views/markdown.js' --reporter=text --reporter=lcov node --test test/*.test.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0",
+    "sanitize-html": "^2.14.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^20.17.10",
+    "@types/sanitize-html": "^2.13.0",
+    "@types/vscode": "^1.90.0",
+    "c8": "^10.1.3",
+    "typescript": "^5.7.2"
+  }
+}

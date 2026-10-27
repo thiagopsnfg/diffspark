@@ -1,0 +1,7 @@
+.git/**
+.vscode/**
+.vscode-test/**
+coverage/**
+src/**
+test/**
+tsconfig.json
