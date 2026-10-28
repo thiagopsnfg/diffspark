@@ -1,17 +1,19 @@
 import * as https from "node:https";
 import {
-  BitbucketRepository,
+  HttpMethod,
   ChangedFile,
-  MergeStrategy,
   PullRequest,
-  PullRequestComment,
-  PullRequestInlineComment,
+  ReviewState,
+  MergeStrategy,
+  RequestOptions,
   PullRequestPage,
   PullRequestSort,
   PullRequestState,
-  RequestOptions,
   RequestTransport,
   TransportResponse,
+  PullRequestComment,
+  BitbucketRepository,
+  PullRequestInlineComment,
 } from "./types";
 
 const API_ORIGIN = "https://api.bitbucket.org";
@@ -26,7 +28,7 @@ function isBitbucketApiUrl(url: URL): boolean {
 
 function httpsTransport(
   url: string,
-  method: "GET" | "POST",
+  method: HttpMethod,
   headers: Record<string, string>,
   body?: string,
 ): Promise<TransportResponse> {
@@ -54,8 +56,16 @@ function httpsTransport(
   });
 }
 
+export class BitbucketApiError extends Error {
+  constructor(readonly statusCode: number, message: string) {
+    super(message);
+    this.name = "BitbucketApiError";
+  }
+}
+
 export class BitbucketClient {
   private readonly authorization: string;
+  private currentAccountId?: Promise<string | undefined>;
 
   constructor(
     email: string,
@@ -165,14 +175,60 @@ export class BitbucketClient {
     });
   }
 
-  approve(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
+  async approve(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
     const path = this.pullRequestPath(repository, pullRequestId, "/approve");
-    return this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" });
+    this.rememberAccountId(await this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" }));
   }
 
-  requestChanges(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
+  unapprove(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
+    const path = this.pullRequestPath(repository, pullRequestId, "/approve");
+    return this.request(new URL(path, API_ORIGIN).toString(), { method: "DELETE" });
+  }
+
+  async requestChanges(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
     const path = this.pullRequestPath(repository, pullRequestId, "/request-changes");
-    return this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" });
+    this.rememberAccountId(await this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" }));
+  }
+
+  removeChangeRequest(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
+    const path = this.pullRequestPath(repository, pullRequestId, "/request-changes");
+    return this.request(new URL(path, API_ORIGIN).toString(), { method: "DELETE" });
+  }
+
+  async getMyReviewState(repository: BitbucketRepository, pullRequestId: number): Promise<ReviewState> {
+    if (!this.currentAccountId) {
+      const accountId = this.request<{ account_id: string }>(
+        new URL(`${API_VERSION_PREFIX}user`, API_ORIGIN).toString(),
+        { method: "GET" },
+      ).then((user) => user.account_id, (error: unknown) => {
+        // GET /user needs read:user:bitbucket; without it, fall back until approve/request-changes reveals the account.
+        if (error instanceof BitbucketApiError && error.statusCode === 403) {
+          return undefined;
+        }
+        throw error;
+      });
+      this.currentAccountId = accountId;
+      accountId.catch(() => {
+        if (this.currentAccountId === accountId) {
+          this.currentAccountId = undefined;
+        }
+      });
+    }
+    const [accountId, pullRequest] = await Promise.all([
+      this.currentAccountId,
+      this.request<PullRequest>(
+        new URL(this.pullRequestPath(repository, pullRequestId, ""), API_ORIGIN).toString(),
+        { method: "GET" },
+      ),
+    ]);
+    if (accountId === undefined) {
+      return "none";
+    }
+    const participant = pullRequest.participants?.find((entry) => entry.user?.account_id === accountId);
+    if (participant?.state === "changes_requested") {
+      return "changes_requested";
+    }
+    return participant?.state === "approved" || participant?.approved ? "approved" : "none";
   }
 
   merge(
@@ -191,6 +247,13 @@ export class BitbucketClient {
         ...(message === undefined ? {} : { message }),
       },
     });
+  }
+
+  private rememberAccountId(participant: unknown): void {
+    const accountId = (participant as { user?: { account_id?: unknown } } | undefined)?.user?.account_id;
+    if (typeof accountId === "string" && accountId) {
+      this.currentAccountId = Promise.resolve(accountId);
+    }
   }
 
   private repositoryPath(repository: BitbucketRepository, suffix: string): string {
@@ -255,7 +318,7 @@ export class BitbucketClient {
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw new Error(this.formatApiError(response));
+      throw new BitbucketApiError(response.statusCode, this.formatApiError(response));
     }
     if (options.raw) {
       return response.body as T;

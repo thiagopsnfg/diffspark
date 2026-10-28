@@ -22,9 +22,7 @@
     "pull request"
   ],
   "main": "./dist/extension.js",
-  "activationEvents": [
-    "onView:bitbucketPrReviewer.pullRequests"
-  ],
+  "activationEvents": [],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -69,6 +67,11 @@
         "title": "DiffSpark: Filter Pull Requests",
         "command": "bitbucketPrReviewer.filterPullRequests",
         "icon": "$(filter)"
+      },
+      {
+        "title": "DiffSpark: Filter Pull Requests by Author",
+        "command": "bitbucketPrReviewer.filterByAuthor",
+        "icon": "$(person)"
       },
       {
         "title": "DiffSpark: Sort Pull Requests",
@@ -137,6 +140,11 @@
         },
         {
           "group": "navigation",
+          "command": "bitbucketPrReviewer.filterByAuthor",
+          "when": "view == bitbucketPrReviewer.pullRequests"
+        },
+        {
+          "group": "navigation",
           "command": "bitbucketPrReviewer.sortPullRequests",
           "when": "view == bitbucketPrReviewer.pullRequests"
         },
@@ -161,7 +169,7 @@
   },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
-    "@types/node": "^20.17.10",
+    "@types/node": "^20.19.43",
     "@types/sanitize-html": "^2.13.0",
     "@types/vscode": "^1.90.0",
     "c8": "^10.1.3",

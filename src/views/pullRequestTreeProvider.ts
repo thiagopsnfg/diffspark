@@ -11,6 +11,11 @@ import {
 
 type TreeNode = PullRequestNode | PathNode;
 
+export interface PullRequestAuthor {
+  accountId: string;
+  displayName: string;
+}
+
 export class PullRequestNode extends vscode.TreeItem {
   constructor(readonly pullRequest: PullRequest) {
     super(pullRequest.title, vscode.TreeItemCollapsibleState.Collapsed);
@@ -70,6 +75,8 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
   private states: PullRequestState[] = ["OPEN"];
   private includeDrafts = false;
   private sort: PullRequestSort = "-updated_on";
+  private author: PullRequestAuthor | undefined;
+  private loadedPullRequests: PullRequest[] = [];
 
   constructor(
     private readonly getClient: () => BitbucketClient,
@@ -122,7 +129,12 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
         this.includeDrafts,
         this.sort,
       );
-      return pullRequests.map((pullRequest) => new PullRequestNode(pullRequest));
+      this.loadedPullRequests = pullRequests;
+      const authorId = this.author?.accountId;
+      const visible = authorId
+        ? pullRequests.filter((pullRequest) => pullRequest.author?.account_id === authorId)
+        : pullRequests;
+      return visible.map((pullRequest) => new PullRequestNode(pullRequest));
     } catch (error) {
       this.onError(error);
       return [];
@@ -132,6 +144,32 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
   setFilters(states: PullRequestState[], includeDrafts: boolean): void {
     this.states = states;
     this.includeDrafts = includeDrafts;
+    this.refresh();
+  }
+
+  getAuthors(): PullRequestAuthor[] {
+    const authors = new Map<string, PullRequestAuthor>();
+    for (const pullRequest of this.loadedPullRequests) {
+      const accountId = pullRequest.author?.account_id;
+      if (accountId && !authors.has(accountId)) {
+        authors.set(accountId, {
+          accountId,
+          displayName: pullRequest.author?.display_name ?? accountId,
+        });
+      }
+    }
+    if (this.author && !authors.has(this.author.accountId)) {
+      authors.set(this.author.accountId, this.author);
+    }
+    return [...authors.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+
+  getAuthor(): PullRequestAuthor | undefined {
+    return this.author;
+  }
+
+  setAuthor(author: PullRequestAuthor | undefined): void {
+    this.author = author;
     this.refresh();
   }
 

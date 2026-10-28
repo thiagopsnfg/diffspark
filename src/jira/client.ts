@@ -1,5 +1,5 @@
 import * as https from "node:https";
-import { RequestTransport, TransportResponse } from "../bitbucket/types";
+import { HttpMethod, RequestTransport, TransportResponse } from "../bitbucket/types";
 
 interface JiraIssueResponse {
   key: string;
@@ -33,7 +33,7 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function httpsTransport(
   url: string,
-  method: "GET" | "POST",
+  method: HttpMethod,
   headers: Record<string, string>,
   body?: string,
 ): Promise<TransportResponse> {

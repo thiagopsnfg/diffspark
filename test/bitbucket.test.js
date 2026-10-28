@@ -482,6 +482,65 @@ test("requests changes through the supported PR endpoint", async () => {
   assert.equal(fake.calls[0].body, undefined);
 });
 
+test("removes approvals and change requests with DELETE", async () => {
+  const fake = fakeTransport([{ statusCode: 204, body: "" }, { statusCode: 204, body: "" }]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  await client.unapprove(repository, 42);
+  await client.removeChangeRequest(repository, 42);
+
+  assert.equal(new URL(fake.calls[0].url).pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/approve");
+  assert.equal(fake.calls[0].method, "DELETE");
+  assert.equal(new URL(fake.calls[1].url).pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/request-changes");
+  assert.equal(fake.calls[1].method, "DELETE");
+});
+
+test("reads the current user's review state from the PR participants", async () => {
+  const pullRequest = (state, approved = false) => ({
+    statusCode: 200,
+    body: JSON.stringify({
+      participants: [
+        { user: { account_id: "other" }, state: "approved", approved: true },
+        { user: { account_id: "me" }, state, approved },
+      ],
+    }),
+  });
+  const fake = fakeTransport([
+    { statusCode: 200, body: JSON.stringify({ account_id: "me" }) },
+    pullRequest("approved", true),
+    pullRequest("changes_requested"),
+    pullRequest(null),
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  assert.equal(await client.getMyReviewState(repository, 42), "approved");
+  assert.equal(await client.getMyReviewState(repository, 42), "changes_requested");
+  assert.equal(await client.getMyReviewState(repository, 42), "none");
+  assert.equal(new URL(fake.calls[0].url).pathname, "/2.0/user");
+  assert.equal(fake.calls.filter((call) => new URL(call.url).pathname === "/2.0/user").length, 1);
+});
+
+test("falls back when the token cannot read the current user, then learns it from approve", async () => {
+  const pullRequest = {
+    statusCode: 200,
+    body: JSON.stringify({ participants: [{ user: { account_id: "me" }, state: "approved", approved: true }] }),
+  };
+  const fake = fakeTransport([
+    { statusCode: 403, body: JSON.stringify({ error: { message: "Your credentials lack one or more required privilege scopes." } }) },
+    pullRequest,
+    pullRequest,
+    { statusCode: 200, body: JSON.stringify({ user: { account_id: "me" }, approved: true }) },
+    pullRequest,
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  assert.equal(await client.getMyReviewState(repository, 42), "none");
+  assert.equal(await client.getMyReviewState(repository, 42), "none");
+  await client.approve(repository, 42);
+  assert.equal(await client.getMyReviewState(repository, 42), "approved");
+  assert.equal(fake.calls.filter((call) => new URL(call.url).pathname === "/2.0/user").length, 1);
+});
+
 test("surfaces API errors and invalid JSON responses", async () => {
   const failed = fakeTransport([
     { statusCode: 403, body: JSON.stringify({ error: { message: "Permission denied." } }) },

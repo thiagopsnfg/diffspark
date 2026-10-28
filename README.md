@@ -10,6 +10,7 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
 
 - Lists pull requests from the active Bitbucket Cloud repository.
 - Defaults to open pull requests with drafts hidden; filter by status and choose whether drafts are included.
+- Filters by author (all authors by default), picking from the authors of the loaded pull requests.
 - Sorts oldest-first or by most recently updated.
 - Expands changed files as folders and files in their repository paths.
 - Opens a side-by-side diff when clicking a changed file, using the common ancestor and the PR source commit from Bitbucket, including added, removed, and renamed files. Add inline comments to changed lines and view existing inline discussions directly in the diff.
@@ -28,8 +29,9 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
    - `write:pullrequest:bitbucket` — approve, request changes, and merge pull requests.
    - `read:repository:bitbucket` — list changed files. Bitbucket redirects the pull request diffstat to the repository diffstat endpoint, which requires this scope.
    - `write:repository:bitbucket` — close the source branch after merging.
+   - `read:user:bitbucket` — identify your account so the pull request view shows whether you already approved or requested changes. Without it, the view still opens but shows the review state as "none" until you approve or request changes.
 4. The credentials are stored in VS Code `SecretStorage`, not workspace settings or files.
-5. Open the **DiffSpark** activity bar view. Use its toolbar to refresh, select a repository, change filters, or sort.
+5. Open the **DiffSpark** activity bar view. Use its toolbar to refresh, select a repository, change filters, filter by author, or sort.
 6. Jira transitions are optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL, Jira account email, and an [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens). The token is used with HTTPS Basic authentication and stored in VS Code `SecretStorage`.
    - The Jira account needs **Browse Projects** and **Transition Issues** for each linked issue. Issue-level security must also allow the account to view the issue.
    - Atlassian API tokens used by this extension do not have configurable permission scopes; they inherit the Jira account's permissions. For OAuth 2.0 integrations, Jira's classic scopes are `read:jira-work` (read issues and transitions) and `write:jira-work` (perform transitions), but this extension does not use OAuth.
@@ -71,3 +73,4 @@ Errors are logged in **Output → DiffSpark**.
 
 - **HTTP 401** — the email or API token is wrong or expired. Run **DiffSpark: Connect** again.
 - **HTTP 403 when expanding a pull request's files** — the token is missing `read:repository:bitbucket`.
+- **Review buttons don't reflect an existing approval or change request** — the token is missing `read:user:bitbucket`.

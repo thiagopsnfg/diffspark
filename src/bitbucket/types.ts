@@ -18,6 +18,7 @@ export interface PullRequest {
   updated_on: string;
   author?: {
     display_name?: string;
+    account_id?: string;
   };
   source: {
     commit?: { hash: string };
@@ -32,12 +33,23 @@ export interface PullRequest {
       name: string;
     };
   };
+  participants?: PullRequestParticipant[];
   links?: {
     html?: {
       href?: string;
     };
   };
 }
+
+export interface PullRequestParticipant {
+  user?: { account_id?: string };
+  approved?: boolean;
+  state?: "approved" | "changes_requested" | null;
+}
+
+export type ReviewState = "none" | "approved" | "changes_requested";
+
+export type HttpMethod = "GET" | "POST" | "DELETE";
 
 export interface PullRequestComment {
   id: number;
@@ -76,7 +88,7 @@ export interface PullRequestPage<T> {
 export type MergeStrategy = "merge_commit" | "squash" | "fast_forward";
 
 export interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: HttpMethod;
   body?: unknown;
   raw?: boolean;
 }
@@ -89,7 +101,7 @@ export interface TransportResponse {
 
 export type RequestTransport = (
   url: string,
-  method: "GET" | "POST",
+  method: HttpMethod,
   headers: Record<string, string>,
   body?: string,
 ) => Promise<TransportResponse>;

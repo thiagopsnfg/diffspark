@@ -3,7 +3,7 @@ import { BitbucketClient } from "./bitbucket/client";
 import { JiraClient } from "./jira/client";
 import { parseBitbucketRemoteUrl } from "./bitbucket/repository";
 import { PullRequestWebview } from "./views/pullRequestWebview";
-import { PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
+import { PullRequestAuthor, PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
 import {
   PullRequest,
   PullRequestState,
@@ -118,6 +118,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   treeView = tree;
   treeView.message = "Connect to Bitbucket to load pull requests.";
   context.subscriptions.push(tree, provider);
+
+  const setAuthorFilter = (author: PullRequestAuthor | undefined): void => {
+    tree.description = author ? `Author: ${author.displayName}` : undefined;
+    provider.setAuthor(author);
+  };
 
   const runAction = async (action: () => Promise<void>): Promise<void> => {
     try {
@@ -615,7 +620,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("bitbucketPrReviewer.selectRepository", () =>
       runAction(async () => {
         if (await chooseRepository(true)) {
-          provider.refresh();
+          setAuthorFilter(undefined);
         }
       }),
     ),
@@ -648,6 +653,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           selectedStates.map((item) => item.label),
           draftChoice.value,
         );
+      }),
+    ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.filterByAuthor", () =>
+      runAction(async () => {
+        const current = provider.getAuthor();
+        const authors = provider.getAuthors();
+        const selected = await vscode.window.showQuickPick(
+          [
+            {
+              label: "All authors",
+              description: current ? undefined : "(current)",
+              author: undefined as PullRequestAuthor | undefined,
+            },
+            ...authors.map((author) => ({
+              label: author.displayName,
+              description: author.accountId === current?.accountId ? "(current)" : undefined,
+              author,
+            })),
+          ],
+          {
+            placeHolder: authors.length > 0
+              ? "Filter pull requests by author"
+              : "No authors found in the loaded pull requests",
+            matchOnDescription: true,
+          },
+        );
+        if (selected) {
+          setAuthorFilter(selected.author);
+        }
       }),
     ),
     vscode.commands.registerCommand("bitbucketPrReviewer.sortPullRequests", () =>
@@ -685,7 +719,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       selectedRepository = undefined;
       treeView!.message = "Select a Bitbucket repository to load pull requests.";
-      provider.refresh();
+      setAuthorFilter(undefined);
     }),
   );
 }

@@ -1,10 +1,9 @@
-import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { BitbucketClient } from "../bitbucket/client";
-import { BitbucketRepository, MergeStrategy, PullRequest, PullRequestComment } from "../bitbucket/types";
-import { JiraClient, JiraTransition } from "../jira/client";
 import { extractJiraIssueKeys } from "../jira/issues";
+import { JiraClient, JiraTransition } from "../jira/client";
 import { renderMarkdown, sanitizeCommentHtml } from "./markdown";
+import { BitbucketRepository, MergeStrategy, PullRequest, PullRequestComment, ReviewState } from "../bitbucket/types";
 
 interface MergeIssueOption {
   key: string;
@@ -16,7 +15,7 @@ interface MergeIssueOption {
 
 export class PullRequestWebview {
   private disposed = false;
-  private hasRequestedChanges = false;
+  private reviewState: ReviewState = "none";
   private readonly availableTransitions = new Map<string, Set<string>>();
   private readonly panel: vscode.WebviewPanel;
 
@@ -66,7 +65,11 @@ export class PullRequestWebview {
   }
 
   private async refresh(): Promise<void> {
-    const comments = await this.client.getComments(this.repository, this.pullRequest.id);
+    const [comments, reviewState] = await Promise.all([
+      this.client.getComments(this.repository, this.pullRequest.id),
+      this.client.getMyReviewState(this.repository, this.pullRequest.id),
+    ]);
+    this.reviewState = reviewState;
     if (!this.disposed) {
       this.panel.webview.html = this.render(comments);
     }
@@ -134,20 +137,34 @@ export class PullRequestWebview {
   }
 
   private async approve(): Promise<void> {
+    const approved = this.reviewState === "approved";
+    const action = approved ? "Unapprove" : "Approve";
     const choice = await vscode.window.showWarningMessage(
-      `Approve pull request #${this.pullRequest.id}?`,
+      `${action} pull request #${this.pullRequest.id}?`,
       { modal: true },
-      "Approve",
+      action,
     );
-    if (choice !== "Approve") {
+    if (choice !== action) {
       return;
     }
-    await this.client.approve(this.repository, this.pullRequest.id);
-    void vscode.window.showInformationMessage(`Pull request #${this.pullRequest.id} approved.`);
+    if (approved) {
+      await this.client.unapprove(this.repository, this.pullRequest.id);
+    } else {
+      await this.client.approve(this.repository, this.pullRequest.id);
+    }
+    void vscode.window.showInformationMessage(
+      `Pull request #${this.pullRequest.id} ${approved ? "unapproved" : "approved"}.`,
+    );
     await this.refresh();
   }
 
   private async requestChanges(): Promise<void> {
+    if (this.reviewState === "changes_requested") {
+      await this.client.removeChangeRequest(this.repository, this.pullRequest.id);
+      void vscode.window.showInformationMessage(`Change request removed from pull request #${this.pullRequest.id}.`);
+      await this.refresh();
+      return;
+    }
     const reason = await vscode.window.showInputBox({
       title: `Request changes on pull request #${this.pullRequest.id}`,
       prompt: "Optionally describe what needs to change. It will be posted as a Markdown comment.",
@@ -159,7 +176,6 @@ export class PullRequestWebview {
       return;
     }
     await this.client.requestChanges(this.repository, this.pullRequest.id);
-    this.hasRequestedChanges = true;
     await this.refresh();
     const comment = reason.trim();
     if (comment) {
@@ -268,7 +284,9 @@ export class PullRequestWebview {
   }
 
   private render(comments: PullRequestComment[]): string {
-    const nonce = randomBytes(16).toString("base64");
+    const nonce = Array.from({ length: 32 }, () => Math.random().toString(36)[2]).join("");
+    const approved = this.reviewState === "approved";
+    const changesRequested = this.reviewState === "changes_requested";
     const description = renderMarkdown(this.pullRequest.description ?? "");
     const state = this.pullRequest.draft
       ? "Draft"
@@ -345,6 +363,9 @@ export class PullRequestWebview {
     button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
     button.requested { color: var(--vscode-editorWarning-foreground); border: 1px solid var(--vscode-editorWarning-foreground); }
+    button.approved { color: var(--vscode-testing-iconPassed, #73c991); border: 1px solid var(--vscode-testing-iconPassed, #73c991); }
+    .review-icon { margin-right: .35rem; }
+    .changes-icon { color: var(--vscode-editorWarning-foreground, #cca700); font-weight: 700; }
     select { color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border); border-radius: 4px; padding: .45rem .6rem; font: inherit; }
     label { color: var(--vscode-descriptionForeground); font-size: .9em; }
     dialog { box-sizing: border-box; width: min(540px, calc(100vw - 2rem)); max-height: min(90vh, 760px); padding: 1.25rem 1.4rem; overflow: auto; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: 10px; box-shadow: 0 12px 32px #0008; }
@@ -383,7 +404,8 @@ export class PullRequestWebview {
   <header class="pr-header">
     <div class="pr-kicker"><span class="status ${statusClass}">${escapeHtml(state)}</span><span>Pull request #${this.pullRequest.id}</span></div>
     <h1>${escapeHtml(this.pullRequest.title)}</h1>
-    <p class="meta">${escapeHtml(this.pullRequest.author?.display_name ?? "Unknown author")} opened this pull request · ${escapeHtml(formatDate(this.pullRequest.created_on))}</p>
+    <p class="meta"><h2>Author: ${escapeHtml(this.pullRequest.author?.display_name ?? "Unknown author")}</h2></p>
+    <p class="meta">Created at: ${escapeHtml(formatDate(this.pullRequest.created_on))}</p>
     <div class="branches" aria-label="Source and destination branches">
       <span class="branch">${escapeHtml(this.pullRequest.source.branch.name)}</span>
       <span class="branch-arrow" aria-hidden="true">→</span>
@@ -393,8 +415,8 @@ export class PullRequestWebview {
   <section class="section">
     <div class="section-title"><h2>Review</h2><p>Choose an action for this pull request</p></div>
     <div class="actions">
-      <button id="approve">Approve</button>
-      <button id="request-changes" class="secondary${this.hasRequestedChanges ? " requested" : ""}">Request changes</button>
+      <button id="approve" class="${approved ? "secondary approved" : ""}"><span class="review-icon" aria-hidden="true">✅</span>${approved ? "Unapprove" : "Approve"}</button>
+      <button id="request-changes" class="secondary${changesRequested ? " requested" : ""}"><span class="review-icon changes-icon" aria-hidden="true">⊖</span>${changesRequested ? "Changes requested" : "Request changes"}</button>
       <button id="merge" class="secondary">Merge…</button>
     </div>
   </section>
