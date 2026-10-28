@@ -15,7 +15,7 @@ import {
 
 const API_ORIGIN = "https://api.bitbucket.org";
 const API_VERSION_PREFIX = "/2.0/";
-const PAGE_LENGTH = 100;
+const PAGE_LENGTH = 50;
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 

@@ -96,6 +96,7 @@ test("lists PRs using selected states and sort and filters drafts", async () => 
   assert.deepEqual(pullRequests.map(({ id }) => id), [2]);
   const requestUrl = new URL(fake.calls[0].url);
   assert.equal(requestUrl.pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests");
+  assert.equal(requestUrl.searchParams.get("pagelen"), "50");
   assert.equal(requestUrl.searchParams.get("q"), 'state IN ("OPEN","MERGED")');
   assert.equal(requestUrl.searchParams.get("sort"), "created_on");
   assert.equal(fake.calls[0].headers.Authorization, `Basic ${Buffer.from("dev@example.com:secret-token").toString("base64")}`);
