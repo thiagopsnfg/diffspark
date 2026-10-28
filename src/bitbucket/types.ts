@@ -71,6 +71,7 @@ export interface RequestOptions {
 export interface TransportResponse {
   statusCode: number;
   body: string;
+  location?: string;
 }
 
 export type RequestTransport = (

@@ -152,6 +152,98 @@ test("reads diffstat paths and falls back to the old path for deleted files", as
   ]);
 });
 
+test("follows the diffstat redirect to the repository diffstat endpoint", async () => {
+  const redirectTarget =
+    "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/iptvplatform/iptv-dashboard:abc%0Ddef?from_pullrequest_id=42&topic=true";
+  const fake = fakeTransport([
+    { statusCode: 302, body: "", location: redirectTarget },
+    {
+      statusCode: 200,
+      body: JSON.stringify({ values: [{ status: "modified", new: { path: "src/components/task.js" } }] }),
+    },
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  assert.deepEqual(await client.getChangedFiles(repository, 42), [
+    { path: "src/components/task.js", status: "modified" },
+  ]);
+  assert.equal(fake.calls.length, 2);
+  assert.equal(new URL(fake.calls[0].url).pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/diffstat");
+  assert.equal(fake.calls[1].url, redirectTarget);
+  assert.equal(fake.calls[1].method, "GET");
+  assert.equal(fake.calls[1].headers.Authorization, fake.calls[0].headers.Authorization);
+});
+
+test("resolves relative redirect locations against the Bitbucket API", async () => {
+  const fake = fakeTransport([
+    { statusCode: 301, body: "", location: "/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/abc" },
+    { statusCode: 200, body: JSON.stringify({ values: [] }) },
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  await client.getChangedFiles(repository, 42);
+  assert.equal(fake.calls[1].url, "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/abc");
+});
+
+test("refuses redirects that would send the token outside the Bitbucket REST API", async () => {
+  for (const location of [
+    "https://evil.example/2.0/repositories/steal",
+    "https://api.bitbucket.org@evil.example/2.0/repositories/steal",
+    "http://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/abc",
+    "https://api.bitbucket.org:8443/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/abc",
+    "https://bitbucket.org/!api/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/abc",
+    "https://api.bitbucket.org/1.0/repositories/iptvplatform/iptv-dashboard",
+  ]) {
+    const fake = fakeTransport([{ statusCode: 302, body: "", location }]);
+    const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+    await assert.rejects(client.getChangedFiles(repository, 42), /redirected outside its REST API/, location);
+    assert.equal(fake.calls.length, 1, location);
+  }
+});
+
+test("limits redirects and rejects redirects without a location", async () => {
+  const location = "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/diffstat/loop";
+  const loop = fakeTransport(Array.from({ length: 10 }, () => ({ statusCode: 302, body: "", location })));
+  const loopClient = new BitbucketClient("dev@example.com", "token", loop.transport);
+  await assert.rejects(loopClient.getChangedFiles(repository, 42), /exceeded the limit of 5 redirects/);
+  assert.equal(loop.calls.length, 6);
+
+  const missing = fakeTransport([{ statusCode: 302, body: "" }]);
+  const missingClient = new BitbucketClient("dev@example.com", "token", missing.transport);
+  await assert.rejects(missingClient.getChangedFiles(repository, 42), /HTTP 302 without a Location header/);
+});
+
+test("repeats writes only on method-preserving redirects", async () => {
+  const location = "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/merge";
+
+  const preserved = fakeTransport([
+    { statusCode: 307, body: "", location },
+    { statusCode: 200, body: JSON.stringify({ state: "MERGED" }) },
+  ]);
+  await new BitbucketClient("dev@example.com", "token", preserved.transport).merge(repository, 42, "squash");
+  assert.equal(preserved.calls[1].method, "POST");
+  assert.equal(preserved.calls[1].body, preserved.calls[0].body);
+
+  const seeOther = fakeTransport([
+    { statusCode: 303, body: "", location },
+    { statusCode: 200, body: JSON.stringify({ state: "MERGED" }) },
+  ]);
+  await new BitbucketClient("dev@example.com", "token", seeOther.transport).merge(repository, 42, "squash");
+  assert.equal(seeOther.calls[1].method, "GET");
+  assert.equal(seeOther.calls[1].body, undefined);
+  assert.equal(seeOther.calls[0].headers["Content-Type"], "application/json");
+  assert.equal(seeOther.calls[1].headers["Content-Type"], undefined);
+  assert.equal(seeOther.calls[1].headers.Authorization, seeOther.calls[0].headers.Authorization);
+
+  const downgraded = fakeTransport([{ statusCode: 302, body: "", location }]);
+  await assert.rejects(
+    new BitbucketClient("dev@example.com", "token", downgraded.transport).merge(repository, 42, "squash"),
+    /redirected POST .*HTTP 302; the request was not repeated/,
+  );
+  assert.equal(downgraded.calls.length, 1);
+});
+
 test("creates Markdown comments and threaded replies", async () => {
   const fake = fakeTransport([
     { statusCode: 201, body: JSON.stringify({ id: 10 }) },

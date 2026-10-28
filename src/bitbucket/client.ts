@@ -16,6 +16,12 @@ import {
 const API_ORIGIN = "https://api.bitbucket.org";
 const API_VERSION_PREFIX = "/2.0/";
 const PAGE_LENGTH = 100;
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function isBitbucketApiUrl(url: URL): boolean {
+  return url.origin === API_ORIGIN && url.pathname.startsWith(API_VERSION_PREFIX);
+}
 
 function httpsTransport(
   url: string,
@@ -31,6 +37,7 @@ function httpsTransport(
         resolve({
           statusCode: response.statusCode ?? 0,
           body: Buffer.concat(chunks).toString("utf8"),
+          location: response.headers.location,
         });
       });
     });
@@ -154,11 +161,8 @@ export class BitbucketClient {
       const page: PullRequestPage<T> = await this.request<PullRequestPage<T>>(nextUrl, { method: "GET" });
       values.push(...page.values);
       nextUrl = page.next;
-      if (nextUrl) {
-        const next = new URL(nextUrl);
-        if (next.origin !== API_ORIGIN || !next.pathname.startsWith(API_VERSION_PREFIX)) {
-          throw new Error("Bitbucket returned a pagination link outside its REST API.");
-        }
+      if (nextUrl && !isBitbucketApiUrl(new URL(nextUrl))) {
+        throw new Error("Bitbucket returned a pagination link outside its REST API.");
       }
     }
 
@@ -166,17 +170,38 @@ export class BitbucketClient {
   }
 
   private async request<T>(url: string, options: RequestOptions): Promise<T> {
-    const method = options.method ?? "GET";
-    const headers: Record<string, string> = {
+    let method = options.method ?? "GET";
+    let headers: Record<string, string> = {
       Accept: "application/json",
       Authorization: this.authorization,
     };
-    const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+    let body = options.body === undefined ? undefined : JSON.stringify(options.body);
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
     }
 
-    const response = await this.transport(url, method, headers, body);
+    let currentUrl = url;
+    let response = await this.transport(currentUrl, method, headers, body);
+    for (let redirects = 0; REDIRECT_STATUSES.has(response.statusCode); redirects++) {
+      if (redirects >= MAX_REDIRECTS) {
+        throw new Error(`Bitbucket exceeded the limit of ${MAX_REDIRECTS} redirects.`);
+      }
+      currentUrl = this.resolveRedirect(currentUrl, response);
+
+      if (response.statusCode === 303) {
+        method = "GET";
+        body = undefined;
+        headers = { Accept: headers.Accept, Authorization: headers.Authorization };
+      } else if (method !== "GET" && response.statusCode !== 307 && response.statusCode !== 308) {
+        // A 301/302 would turn the write into a GET, so report it instead of claiming success.
+        throw new Error(
+          `Bitbucket redirected ${method} ${new URL(url).pathname} with HTTP ${response.statusCode}; the request was not repeated.`,
+        );
+      }
+
+      response = await this.transport(currentUrl, method, headers, body);
+    }
+
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw new Error(this.formatApiError(response));
     }
@@ -189,6 +214,24 @@ export class BitbucketClient {
     } catch {
       throw new Error(`Bitbucket returned invalid JSON for ${method} ${new URL(url).pathname}.`);
     }
+  }
+
+  private resolveRedirect(currentUrl: string, response: TransportResponse): string {
+    if (!response.location) {
+      throw new Error(`Bitbucket returned HTTP ${response.statusCode} without a Location header.`);
+    }
+
+    let target: URL;
+    try {
+      target = new URL(response.location, currentUrl);
+    } catch {
+      throw new Error("Bitbucket returned an invalid redirect location.");
+    }
+    // The Authorization header is resent, so only follow redirects that stay on the REST API.
+    if (!isBitbucketApiUrl(target)) {
+      throw new Error("Bitbucket redirected outside its REST API; the request was not followed.");
+    }
+    return target.toString();
   }
 
   private formatApiError(response: TransportResponse): string {
