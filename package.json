@@ -4,6 +4,10 @@
   "description": "Smarter reviews. Better code. Review Bitbucket Cloud pull requests from VS Code.",
   "version": "0.1.0",
   "publisher": "thiagopsnfg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thiagopsnfg/diffspark.git"
+  },
   "icon": "resources/diffspark-icon.png",
   "license": "MIT",
   "engines": {

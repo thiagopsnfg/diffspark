@@ -1,6 +1,6 @@
 # DiffSpark
 
-![DiffSpark — Smarter reviews. Better code.](resources/diffspark-logo.svg)
+![DiffSpark — Smarter reviews. Better code.](resources/diffspark-logo.png)
 
 **Smarter reviews. Better code.**
 
@@ -40,6 +40,15 @@ npm run compile
 ```
 
 Open the folder in VS Code and press **F5** to launch an Extension Development Host.
+
+## Install locally in another project
+
+```sh
+npx @vscode/vsce package --githubBranch main
+code --install-extension diffspark-0.1.0.vsix --force
+```
+
+Reload VS Code, open the target repository, and run **DiffSpark: Connect**.
 
 ## Limitations
 
