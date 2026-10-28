@@ -4,6 +4,16 @@ import { extractJiraIssueKeys } from "../jira/issues";
 import { JiraClient, JiraTransition } from "../jira/client";
 import { renderMarkdown, sanitizeCommentHtml } from "./markdown";
 import { BitbucketRepository, MergeStrategy, PullRequest, PullRequestComment, ReviewState } from "../bitbucket/types";
+import { CommentImprover } from "../ai/service";
+import {
+  describeImproveOptions,
+  IMPROVE_ACTIONS,
+  IMPROVE_TONES,
+  ImproveOptions,
+  isImproveAction,
+  isImproveTone,
+  TRANSLATE_LANGUAGES,
+} from "../ai/prompt";
 
 interface MergeIssueOption {
   key: string;
@@ -18,6 +28,8 @@ export class PullRequestWebview {
   private reviewState: ReviewState = "none";
   private readonly availableTransitions = new Map<string, Set<string>>();
   private readonly panel: vscode.WebviewPanel;
+  private comments: PullRequestComment[] = [];
+  private improveCancellation: vscode.CancellationTokenSource | undefined;
 
   private constructor(
     private readonly pullRequest: PullRequest,
@@ -27,6 +39,7 @@ export class PullRequestWebview {
     private readonly onMerged: () => void,
     private readonly getJiraClient: () => JiraClient | undefined,
     private readonly ensureJiraClient: () => Promise<boolean>,
+    private readonly improver: CommentImprover,
   ) {
     this.panel = vscode.window.createWebviewPanel(
       "bitbucketPullRequest",
@@ -36,6 +49,8 @@ export class PullRequestWebview {
     );
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      this.improveCancellation?.cancel();
+      this.improveCancellation?.dispose();
     });
     this.panel.webview.onDidReceiveMessage((message: unknown) => {
       void this.handleMessage(message);
@@ -50,6 +65,7 @@ export class PullRequestWebview {
     onMerged: () => void,
     getJiraClient: () => JiraClient | undefined,
     ensureJiraClient: () => Promise<boolean>,
+    improver: CommentImprover,
   ): Promise<PullRequestWebview> {
     const view = new PullRequestWebview(
       pullRequest,
@@ -59,6 +75,7 @@ export class PullRequestWebview {
       onMerged,
       getJiraClient,
       ensureJiraClient,
+      improver,
     );
     await view.refresh();
     return view;
@@ -70,8 +87,63 @@ export class PullRequestWebview {
       this.client.getMyReviewState(this.repository, this.pullRequest.id),
     ]);
     this.reviewState = reviewState;
+    this.comments = comments;
     if (!this.disposed) {
       this.panel.webview.html = this.render(comments);
+    }
+  }
+
+  private async improveComment(
+    requestId: number,
+    markdown: string,
+    options: ImproveOptions,
+    parentId: number | undefined,
+  ): Promise<void> {
+    this.improveCancellation?.cancel();
+    this.improveCancellation?.dispose();
+    const cancellation = new vscode.CancellationTokenSource();
+    this.improveCancellation = cancellation;
+    const parent = parentId === undefined ? undefined : this.comments.find((comment) => comment.id === parentId);
+    const discussion = parent
+      ? [parent, ...this.comments.filter((comment) => comment.parent?.id === parent.id)].map(
+          (comment) => `${comment.user?.display_name ?? "Unknown"}: ${comment.content?.raw ?? ""}`,
+        )
+      : [];
+    try {
+      const suggestion = await this.improver.improve(
+        {
+          ...options,
+          comment: markdown,
+          pullRequestTitle: this.pullRequest.title,
+          pullRequestDescription: this.pullRequest.description,
+          discussion,
+          filePath: parent?.inline?.path,
+        },
+        cancellation.token,
+      );
+      if (!this.disposed && this.improveCancellation === cancellation) {
+        await this.panel.webview.postMessage({
+          command: "improveResult",
+          requestId,
+          suggestion,
+          label: describeImproveOptions(options),
+          provider: this.improver.getProviderLabel(),
+        });
+      }
+    } catch (error) {
+      if (!this.disposed && this.improveCancellation === cancellation) {
+        const cancelled = error instanceof vscode.CancellationError;
+        await this.panel.webview.postMessage({
+          command: "improveFailed",
+          requestId,
+          message: cancelled ? "" : errorMessage(error),
+        });
+      }
+    } finally {
+      if (this.improveCancellation === cancellation) {
+        this.improveCancellation = undefined;
+      }
+      cancellation.dispose();
     }
   }
 
@@ -80,6 +152,14 @@ export class PullRequestWebview {
       this.onError(new Error("Received an invalid pull request view message."));
       if (message && typeof message === "object" && "command" in message && message.command === "merge") {
         await this.panel.webview.postMessage({ command: "mergeFailed" });
+      }
+      if (message && typeof message === "object" && "command" in message && message.command === "improveComment") {
+        const requestId = (message as { requestId?: unknown }).requestId;
+        await this.panel.webview.postMessage({
+          command: "improveFailed",
+          requestId,
+          message: "The comment must contain 1–10,000 characters.",
+        });
       }
       return;
     }
@@ -100,6 +180,24 @@ export class PullRequestWebview {
       if (message.command === "connectJira") {
         await this.ensureJiraClient();
         await this.loadMergeOptions();
+        return;
+      }
+      if (message.command === "improveComment") {
+        await this.improveComment(
+          message.requestId,
+          message.markdown,
+          { action: message.action, tone: message.tone, targetLanguage: message.targetLanguage },
+          message.parentId,
+        );
+        return;
+      }
+      if (message.command === "cancelImprove") {
+        this.improveCancellation?.cancel();
+        return;
+      }
+      if (message.command === "configureAi") {
+        await this.improver.selectProvider();
+        await this.panel.webview.postMessage({ command: "aiProvider", label: this.improver.getProviderLabel() });
         return;
       }
       if (message.command === "merge") {
@@ -391,6 +489,53 @@ export class PullRequestWebview {
     .merge-footer { display: flex; justify-content: flex-end; gap: .6rem; margin-top: 1rem; }
     .merge-footer button:disabled { opacity: .6; cursor: wait; }
     .composer-actions { margin-top: .75rem; }
+    .editor { border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 6px; background: var(--vscode-input-background); }
+    .editor:focus-within { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+    .editor textarea { display: block; border: 0; border-radius: 0 0 6px 6px; background: transparent; }
+    .editor textarea:focus { outline: none; }
+    .editor-toolbar { position: relative; display: flex; align-items: center; gap: .15rem; padding: .3rem .4rem; border-bottom: 1px solid var(--vscode-panel-border); }
+    .tool-button { display: inline-flex; align-items: center; gap: .35rem; padding: .3rem .45rem; color: var(--vscode-foreground); background: transparent; border-radius: 4px; font-size: .92em; }
+    .tool-button:hover:not(:disabled), .tool-button[aria-expanded="true"] { background: var(--vscode-toolbar-hoverBackground, #8882); }
+    .tool-button:disabled { opacity: .5; cursor: default; }
+    .tool-button svg { flex: 0 0 auto; width: 16px; height: 16px; }
+    .ai-toggle { gap: .15rem; padding-right: .3rem; }
+    .ai-toggle svg:last-child { width: 12px; height: 12px; opacity: .8; }
+    .ai-improve.is-loading svg { animation: wiggle 1s ease-in-out infinite; }
+    @keyframes wiggle { 0%, 100% { transform: rotate(0); } 50% { transform: rotate(-14deg); } }
+    .ai-menu-anchor { position: relative; }
+    .ai-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 250px; padding: .3rem; color: var(--vscode-menu-foreground, var(--vscode-foreground)); background: var(--vscode-menu-background, var(--vscode-editorWidget-background)); border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, var(--vscode-panel-border))); border-radius: 6px; box-shadow: 0 6px 20px var(--vscode-widget-shadow, #0006); }
+    .ai-menu[hidden] { display: none; }
+    .ai-submenu { top: -.35rem; left: calc(100% + 2px); min-width: 230px; }
+    .ai-menu-item-wrap { position: relative; }
+    .ai-menu-item { display: flex; align-items: center; gap: .6rem; width: 100%; padding: .42rem .6rem; color: inherit; background: transparent; border-radius: 4px; text-align: left; font-size: .93em; }
+    .ai-menu-item:hover, .ai-menu-item:focus-visible, .ai-menu-item[aria-expanded="true"] { color: var(--vscode-menu-selectionForeground, inherit); background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); outline: none; }
+    .ai-menu-item svg { flex: 0 0 auto; width: 16px; height: 16px; opacity: .85; }
+    .ai-menu-item > span { flex: 1 1 auto; }
+    .ai-menu-item small { display: block; color: var(--vscode-descriptionForeground); font-size: .85em; }
+    .ai-menu-item:hover small, .ai-menu-item:focus-visible small { color: inherit; opacity: .8; }
+    .ai-menu-separator { height: 1px; margin: .3rem .2rem; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); }
+    .ai-menu-footer { color: var(--vscode-descriptionForeground); font-size: .86em; }
+    .ai-other { display: flex; gap: .3rem; padding: .3rem .3rem .2rem; }
+    .ai-other input { flex: 1 1 auto; min-width: 0; padding: .3rem .45rem; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 4px; font: inherit; font-size: .9em; }
+    .ai-other button { padding: .3rem .55rem; }
+    .ai-panel { margin-top: .75rem; padding: .8rem .9rem; border: 1px solid color-mix(in srgb, var(--vscode-textLink-foreground) 45%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--vscode-textLink-foreground) 6%, var(--vscode-editor-background)); }
+    .ai-panel-header { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .6rem; }
+    .ai-panel-title { display: inline-flex; align-items: center; gap: .4rem; font-weight: 600; }
+    .ai-panel-title svg { width: 16px; height: 16px; color: var(--vscode-textLink-foreground); }
+    .ai-panel-provider { color: var(--vscode-descriptionForeground); font-size: .85em; }
+    .ai-suggestion { min-height: 8rem; }
+    .ai-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin-top: .65rem; }
+    .ai-disclaimer { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: .8em; }
+    .ai-error { color: var(--vscode-errorForeground); overflow-wrap: anywhere; }
+    .ai-loading[hidden], .ai-actions[hidden], .ai-error[hidden], .ai-suggestion[hidden] { display: none; }
+    .shimmer { height: .7rem; margin: .45rem 0; border-radius: 4px; background: linear-gradient(90deg, var(--vscode-panel-border) 0%, color-mix(in srgb, var(--vscode-textLink-foreground) 35%, transparent) 50%, var(--vscode-panel-border) 100%); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; }
+    .shimmer--short { width: 60%; }
+    @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+    .ai-loading-footer { display: flex; align-items: center; justify-content: space-between; margin-top: .6rem; color: var(--vscode-descriptionForeground); font-size: .88em; }
+    .link-button { padding: 0; color: var(--vscode-textLink-foreground); background: transparent; }
+    .link-button:hover { background: transparent; text-decoration: underline; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    @media (prefers-reduced-motion: reduce) { .shimmer, .ai-improve.is-loading svg { animation: none; } }
     @media (max-width: 560px) {
       body { padding: 1rem .85rem 2rem; }
       .section { padding: .9rem; }
@@ -430,7 +575,36 @@ export class PullRequestWebview {
   </section>
   <section class="section">
     <div class="section-title"><h2 id="composer-title">Add a comment</h2></div>
-    <textarea id="comment-input" maxlength="10000" placeholder="Write a Markdown comment…"></textarea>
+    <div class="editor">
+      <div class="editor-toolbar" role="toolbar" aria-label="Comment tools">
+        <div class="ai-menu-anchor">
+          <button id="ai-menu-toggle" type="button" class="tool-button ai-toggle" aria-haspopup="menu" aria-expanded="false" aria-controls="ai-menu" title="More AI actions">${AI_LOGO_SVG}${icon("chevronDown")}</button>
+          ${renderAiMenu(this.improver.getProviderLabel())}
+        </div>
+        <button id="ai-improve" type="button" class="tool-button ai-improve" title="Improve comment with AI">${icon("wand")}<span id="ai-improve-label">Improve comment</span></button>
+      </div>
+      <textarea id="comment-input" maxlength="10000" placeholder="Write a Markdown comment…"></textarea>
+    </div>
+    <div id="ai-panel" class="ai-panel" hidden>
+      <div class="ai-panel-header">
+        <span class="ai-panel-title">${icon("wand")}<span id="ai-panel-label">Improve comment</span></span>
+        <span id="ai-panel-provider" class="ai-panel-provider"></span>
+      </div>
+      <div id="ai-loading" class="ai-loading" role="status" aria-live="polite">
+        <span class="visually-hidden">Improving your comment…</span>
+        <div class="shimmer"></div><div class="shimmer"></div><div class="shimmer shimmer--short"></div>
+        <div class="ai-loading-footer"><span>Improving your comment…</span><button id="ai-stop" type="button" class="link-button">Stop</button></div>
+      </div>
+      <div id="ai-error" class="ai-error" role="alert" hidden></div>
+      <textarea id="ai-suggestion" class="ai-suggestion" aria-label="AI suggestion (editable)" hidden></textarea>
+      <div id="ai-actions" class="ai-actions" hidden>
+        <button id="ai-replace" type="button">Replace</button>
+        <button id="ai-insert" type="button" class="secondary">Insert below</button>
+        <button id="ai-retry" type="button" class="secondary">Try again</button>
+        <button id="ai-discard" type="button" class="secondary">Discard</button>
+        <span class="ai-disclaimer">AI-generated content may be inaccurate. Review before posting.</span>
+      </div>
+    </div>
     <div class="composer-actions"><button id="send-comment">Comment</button><button id="cancel-reply" class="secondary" hidden>Cancel reply</button></div>
   </section>
   <dialog id="merge-dialog" class="merge-dialog">
@@ -491,6 +665,236 @@ export class PullRequestWebview {
     send.addEventListener("click", () => {
       vscode.postMessage({ command: replyTo === undefined ? "comment" : "reply", markdown: input.value, parentId: replyTo });
     });
+
+    const improveButton = document.getElementById("ai-improve");
+    const improveLabel = document.getElementById("ai-improve-label");
+    const menuToggle = document.getElementById("ai-menu-toggle");
+    const aiMenu = document.getElementById("ai-menu");
+    const aiPanel = document.getElementById("ai-panel");
+    const aiPanelLabel = document.getElementById("ai-panel-label");
+    const aiPanelProvider = document.getElementById("ai-panel-provider");
+    const aiLoading = document.getElementById("ai-loading");
+    const aiError = document.getElementById("ai-error");
+    const aiSuggestion = document.getElementById("ai-suggestion");
+    const aiActions = document.getElementById("ai-actions");
+    const aiReplace = document.getElementById("ai-replace");
+    const aiInsert = document.getElementById("ai-insert");
+    const otherLanguage = document.getElementById("ai-other-language");
+    let improveRequestId = 0;
+    let improving = false;
+    let lastImprove;
+
+    const updateImproveState = () => {
+      improveButton.disabled = improving || !input.value.trim();
+      menuToggle.disabled = improving;
+      improveButton.classList.toggle("is-loading", improving);
+      improveLabel.textContent = improving ? "Improving…" : "Improve comment";
+    };
+    const showPanel = (state, text) => {
+      aiPanel.hidden = false;
+      aiLoading.hidden = state !== "loading";
+      aiError.hidden = state !== "error";
+      aiSuggestion.hidden = state !== "result";
+      aiActions.hidden = state === "loading";
+      aiReplace.hidden = state !== "result";
+      aiInsert.hidden = state !== "result";
+      if (state === "error") aiError.textContent = text;
+      if (state === "result") aiSuggestion.value = text;
+    };
+    const hidePanel = () => {
+      aiPanel.hidden = true;
+      aiSuggestion.value = "";
+    };
+    const requestImprove = (options, markdown) => {
+      const text = markdown ?? input.value;
+      closeMenus();
+      if (!text.trim()) {
+        input.focus();
+        return;
+      }
+      lastImprove = { options, markdown: text };
+      improving = true;
+      updateImproveState();
+      aiPanelLabel.textContent = options.label;
+      aiPanelProvider.textContent = "";
+      showPanel("loading");
+      vscode.postMessage({
+        command: "improveComment",
+        requestId: ++improveRequestId,
+        markdown: text.slice(0, 10000),
+        action: options.action,
+        tone: options.tone,
+        targetLanguage: options.targetLanguage,
+        parentId: replyTo,
+      });
+    };
+    const finishImprove = () => {
+      improving = false;
+      updateImproveState();
+    };
+
+    const menus = () => [aiMenu, ...aiMenu.querySelectorAll(".ai-submenu")];
+    const visibleItems = (menu) => Array.from(menu.children).flatMap((child) =>
+      child.classList.contains("ai-menu-item-wrap") ? [child.querySelector(":scope > .ai-menu-item")] :
+      child.classList.contains("ai-menu-item") ? [child] :
+      child.classList.contains("ai-other") ? [child.querySelector("input")] : []);
+    const closeSubmenus = (except) => {
+      aiMenu.querySelectorAll(".ai-submenu").forEach((submenu) => {
+        if (submenu === except) return;
+        submenu.hidden = true;
+        submenu.previousElementSibling.setAttribute("aria-expanded", "false");
+      });
+    };
+    function closeMenus(focusToggle) {
+      closeSubmenus();
+      aiMenu.hidden = true;
+      menuToggle.setAttribute("aria-expanded", "false");
+      if (focusToggle) menuToggle.focus();
+    }
+    const openMenu = () => {
+      aiMenu.hidden = false;
+      menuToggle.setAttribute("aria-expanded", "true");
+      visibleItems(aiMenu)[0]?.focus();
+    };
+    const openSubmenu = (toggle, focusFirst) => {
+      const submenu = toggle.nextElementSibling;
+      closeSubmenus(submenu);
+      submenu.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      if (focusFirst) visibleItems(submenu)[0]?.focus();
+    };
+    const optionsFromItem = (item) => ({
+      action: item.dataset.action,
+      tone: item.dataset.tone || undefined,
+      targetLanguage: item.dataset.language || undefined,
+      label: item.dataset.label,
+    });
+    const translateOther = () => {
+      const language = otherLanguage.value.trim();
+      if (!language) {
+        otherLanguage.focus();
+        return;
+      }
+      requestImprove({ action: "translate", targetLanguage: language.slice(0, 60), label: "Translate to " + language.slice(0, 60) });
+    };
+
+    improveButton.addEventListener("click", () => requestImprove({ action: "improve", label: "Improve comment" }));
+    menuToggle.addEventListener("click", () => (aiMenu.hidden ? openMenu() : closeMenus()));
+    menuToggle.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        openMenu();
+      }
+    });
+    aiMenu.addEventListener("click", (event) => {
+      if (event.target.closest("#ai-other-submit")) {
+        translateOther();
+        return;
+      }
+      const item = event.target.closest(".ai-menu-item");
+      if (!item) return;
+      if (item.hasAttribute("data-submenu-toggle")) {
+        item.getAttribute("aria-expanded") === "true" ? closeSubmenus() : openSubmenu(item, false);
+        return;
+      }
+      if (item.hasAttribute("data-configure")) {
+        closeMenus();
+        vscode.postMessage({ command: "configureAi" });
+        return;
+      }
+      if (item.dataset.action) requestImprove(optionsFromItem(item));
+    });
+    aiMenu.querySelectorAll("[data-submenu-toggle]").forEach((toggle) => {
+      toggle.parentElement.addEventListener("mouseenter", () => openSubmenu(toggle, false));
+      toggle.parentElement.addEventListener("mouseleave", () => {
+        if (!toggle.nextElementSibling.contains(document.activeElement)) {
+          toggle.nextElementSibling.hidden = true;
+          toggle.setAttribute("aria-expanded", "false");
+        }
+      });
+    });
+    aiMenu.addEventListener("keydown", (event) => {
+      const current = document.activeElement;
+      const menu = menus().filter((item) => !item.hidden && item.contains(current)).pop();
+      if (!menu) return;
+      const items = visibleItems(menu);
+      const index = items.indexOf(current);
+      if (current === otherLanguage && event.key === "Enter") {
+        event.preventDefault();
+        translateOther();
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+        items[(next + items.length) % items.length]?.focus();
+      } else if (event.key === "ArrowRight" && current.hasAttribute("data-submenu-toggle")) {
+        event.preventDefault();
+        openSubmenu(current, true);
+      } else if ((event.key === "ArrowLeft" || event.key === "Escape") && menu !== aiMenu) {
+        event.preventDefault();
+        const toggle = menu.previousElementSibling;
+        closeSubmenus();
+        toggle.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        closeMenus(true);
+      } else if (event.key === "Tab") {
+        closeMenus();
+      }
+    });
+    document.addEventListener("click", (event) => {
+      if (!aiMenu.hidden && !aiMenu.contains(event.target) && !menuToggle.contains(event.target)) closeMenus();
+    });
+    input.addEventListener("input", updateImproveState);
+    document.getElementById("ai-stop").addEventListener("click", () => {
+      improveRequestId++;
+      vscode.postMessage({ command: "cancelImprove" });
+      finishImprove();
+      hidePanel();
+      input.focus();
+    });
+    aiReplace.addEventListener("click", () => {
+      input.value = aiSuggestion.value.slice(0, 10000);
+      hidePanel();
+      updateImproveState();
+      input.focus();
+    });
+    aiInsert.addEventListener("click", () => {
+      input.value = (input.value.trimEnd() + "\\n\\n" + aiSuggestion.value.trim()).slice(0, 10000);
+      hidePanel();
+      updateImproveState();
+      input.focus();
+    });
+    document.getElementById("ai-retry").addEventListener("click", () => {
+      if (lastImprove) requestImprove(lastImprove.options, lastImprove.markdown);
+    });
+    document.getElementById("ai-discard").addEventListener("click", () => {
+      hidePanel();
+      input.focus();
+    });
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (message.command === "aiProvider") {
+        document.getElementById("ai-provider-name").textContent = message.label;
+        return;
+      }
+      if ((message.command !== "improveResult" && message.command !== "improveFailed") || message.requestId !== improveRequestId) {
+        return;
+      }
+      finishImprove();
+      if (message.command === "improveResult") {
+        aiPanelLabel.textContent = "AI suggestion · " + message.label;
+        aiPanelProvider.textContent = "by " + message.provider;
+        showPanel("result", message.suggestion);
+        aiSuggestion.focus();
+      } else if (message.message) {
+        showPanel("error", message.message);
+      } else {
+        hidePanel();
+      }
+    });
+    updateImproveState();
     document.getElementById("approve").addEventListener("click", () => vscode.postMessage({ command: "approve" }));
     document.getElementById("request-changes").addEventListener("click", () => vscode.postMessage({ command: "requestChanges" }));
     document.getElementById("merge").addEventListener("click", () => {
@@ -630,6 +1034,17 @@ type WebviewMessage =
   | { command: "loadMergeOptions" }
   | { command: "connectJira" }
   | {
+      command: "improveComment";
+      requestId: number;
+      markdown: string;
+      action: ImproveOptions["action"];
+      tone?: ImproveOptions["tone"];
+      targetLanguage?: string;
+      parentId?: number;
+    }
+  | { command: "cancelImprove" }
+  | { command: "configureAi" }
+  | {
       command: "merge";
       strategy: MergeStrategy;
       closeSourceBranch: boolean;
@@ -646,9 +1061,24 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
     candidate.command === "approve" ||
     candidate.command === "requestChanges" ||
     candidate.command === "loadMergeOptions" ||
-    candidate.command === "connectJira"
+    candidate.command === "connectJira" ||
+    candidate.command === "cancelImprove" ||
+    candidate.command === "configureAi"
   ) {
     return true;
+  }
+  if (candidate.command === "improveComment") {
+    return (
+      Number.isInteger(candidate.requestId) &&
+      typeof candidate.markdown === "string" &&
+      candidate.markdown.trim().length > 0 &&
+      candidate.markdown.length <= 10_000 &&
+      isImproveAction(candidate.action) &&
+      (candidate.tone === undefined || isImproveTone(candidate.tone)) &&
+      (candidate.targetLanguage === undefined ||
+        (typeof candidate.targetLanguage === "string" && candidate.targetLanguage.length <= 60)) &&
+      (candidate.parentId === undefined || (Number.isInteger(candidate.parentId) && Number(candidate.parentId) > 0))
+    );
   }
   if (candidate.command === "merge") {
     return (
@@ -677,6 +1107,58 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
     );
   }
   return false;
+}
+
+const ICON_PATHS: Record<string, string> = {
+  wand: '<path d="M2.5 13.5 10 6"/><path d="m9 5 2 2"/><path d="M12.5 1.5v3M11 3h3"/><path d="M5 1.5v2M4 2.5h2"/><path d="M13 9v2M12 10h2"/>',
+  chevronDown: '<path d="m3.5 6 4.5 4.5L12.5 6"/>',
+  chevronRight: '<path d="m6 3.5 4.5 4.5L6 12.5"/>',
+  "list-flat": '<path d="M6 4h8M6 8h8M6 12h8"/><path d="M2.5 4h.01M2.5 8h.01M2.5 12h.01" stroke-width="2"/>',
+  "whole-word": '<path d="m1.5 13 3.25-9L8 13M2.6 10h4.3"/><path d="m9.5 10.5 2 2 3.5-4.5"/>',
+  sync: '<path d="M1.5 4.5h3l6 7h4M1.5 11.5h3l1.8-2.1M9.7 6.6l1.8-2.1h3"/><path d="m12.5 2.5 2 2-2 2M12.5 9.5l2 2-2 2"/>',
+  comment: '<path d="M2 2.5h12v8.5H7l-3.5 3v-3H2z"/>',
+  "fold-up": '<path d="M2 5h12M2 8.5h8"/><path d="m11.5 12.5 1.5-1.5 1.5 1.5"/>',
+  "fold-down": '<path d="M2 3.5h12M2 6.5h12M2 9.5h12M2 12.5h7"/>',
+  code: '<path d="M5 4 1.5 8 5 12M11 4l3.5 4-3.5 4"/>',
+  globe: '<path d="M1.5 3h7M5 1.5V3M3 3c.5 2.6 2.4 4.6 4.8 5.6M7 3c-.6 2.6-2.5 4.6-5 5.6"/><path d="m8.5 14.5 3-7.5 3 7.5M9.5 12h4"/>',
+  gear: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/>',
+};
+
+function icon(name: string): string {
+  return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] ?? ""}</svg>`;
+}
+
+const AI_LOGO_SVG = `<svg viewBox="0 0 16 16" aria-hidden="true"><defs><linearGradient id="ai-logo-gradient" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#a855f7"/><stop offset="1" stop-color="#f97316"/></linearGradient></defs><path fill="url(#ai-logo-gradient)" d="M8 .8c.5 3.6 2.1 5.4 6.2 6.2v2c-4.1.8-5.7 2.6-6.2 6.2h-.1C7.4 11.6 5.8 9.8 1.8 9V7c4-.8 5.6-2.6 6.1-6.2z"/></svg>`;
+
+function renderAiMenu(providerLabel: string): string {
+  const item = (attributes: string, label: string, iconName?: string, description?: string): string =>
+    `<button type="button" class="ai-menu-item" role="menuitem" ${attributes}${description ? ` title="${escapeHtml(description)}"` : ""}>${iconName ? icon(iconName) : ""}<span>${escapeHtml(label)}</span></button>`;
+  const entries = IMPROVE_ACTIONS.map((action) => {
+    if (action.submenu === "tone") {
+      const tones = IMPROVE_TONES.map((tone) =>
+        `<button type="button" class="ai-menu-item" role="menuitem" data-action="tone" data-tone="${tone.id}" data-label="${escapeHtml(describeImproveOptions({ action: "tone", tone: tone.id }))}"><span>${escapeHtml(tone.label)}<small>${escapeHtml(tone.description)}</small></span></button>`,
+      ).join("");
+      return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${tones}</div></div>`;
+    }
+    if (action.submenu === "translate") {
+      const languages = TRANSLATE_LANGUAGES.map((language) =>
+        item(
+          `data-action="translate" data-language="${escapeHtml(language)}" data-label="${escapeHtml(describeImproveOptions({ action: "translate", targetLanguage: language }))}"`,
+          language,
+        ),
+      ).join("");
+      const other = `<div class="ai-other"><input id="ai-other-language" type="text" maxlength="60" placeholder="Other language…" aria-label="Other language"><button type="button" id="ai-other-submit" class="secondary" aria-label="Translate to the typed language">→</button></div>`;
+      return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${languages}${other}</div></div>`;
+    }
+    return item(
+      `data-action="${action.id}" data-label="${escapeHtml(describeImproveOptions({ action: action.id }))}"`,
+      action.label,
+      action.icon,
+      action.description,
+    );
+  }).join("");
+  const footer = `<button type="button" class="ai-menu-item ai-menu-footer" role="menuitem" data-configure>${icon("gear")}<span>AI provider: <span id="ai-provider-name">${escapeHtml(providerLabel)}</span> · Change…</span></button>`;
+  return `<div id="ai-menu" class="ai-menu" role="menu" aria-label="AI actions" hidden>${entries}<div class="ai-menu-separator" role="separator"></div>${footer}</div>`;
 }
 
 function escapeHtml(value: string): string {

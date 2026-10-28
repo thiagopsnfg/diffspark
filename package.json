@@ -100,19 +100,167 @@
       {
         "title": "Reply",
         "command": "bitbucketPrReviewer.replyDiffComment"
+      },
+      {
+        "title": "Improve comment",
+        "command": "bitbucketPrReviewer.improveDiffComment",
+        "icon": "$(wand)"
+      },
+      {
+        "title": "AI actions ▾",
+        "command": "bitbucketPrReviewer.improveDiffCommentWith",
+        "icon": "$(chevron-down)"
+      },
+      {
+        "title": "Replace & post",
+        "command": "bitbucketPrReviewer.aiSuggestionReplace"
+      },
+      {
+        "title": "Insert below",
+        "command": "bitbucketPrReviewer.aiSuggestionInsert"
+      },
+      {
+        "title": "Try again",
+        "command": "bitbucketPrReviewer.aiSuggestionRetry"
+      },
+      {
+        "title": "Discard",
+        "command": "bitbucketPrReviewer.aiSuggestionDiscard"
+      },
+      {
+        "title": "Post comment",
+        "command": "bitbucketPrReviewer.aiDraftPost"
+      },
+      {
+        "title": "Improve comment",
+        "command": "bitbucketPrReviewer.aiDraftImprove",
+        "icon": "$(wand)"
+      },
+      {
+        "title": "AI actions ▾",
+        "command": "bitbucketPrReviewer.aiDraftImproveWith",
+        "icon": "$(chevron-down)"
+      },
+      {
+        "title": "Delete draft",
+        "command": "bitbucketPrReviewer.aiDraftDelete"
+      },
+      {
+        "title": "DiffSpark: Select AI Provider",
+        "command": "bitbucketPrReviewer.selectAiProvider",
+        "icon": "$(wand)"
+      },
+      {
+        "title": "DiffSpark: Set AI API Key",
+        "command": "bitbucketPrReviewer.setAiApiKey",
+        "icon": "$(key)"
       }
     ],
+    "configuration": {
+      "title": "DiffSpark",
+      "properties": {
+        "diffspark.ai.provider": {
+          "type": "string",
+          "enum": [
+            "copilot",
+            "openai",
+            "gemini"
+          ],
+          "enumDescriptions": [
+            "GitHub Copilot through the VS Code Language Model API (no API key needed).",
+            "OpenAI (or an OpenAI-compatible endpoint) using an API key.",
+            "Google Gemini using an API key."
+          ],
+          "default": "copilot",
+          "markdownDescription": "AI provider used by **Improve comment**. API keys are set with the `DiffSpark: Set AI API Key` command and stored in VS Code's secret storage."
+        },
+        "diffspark.ai.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional model for **Improve comment**. Copilot: a model family such as `gpt-4.1`. OpenAI default: `gpt-4o-mini`. Gemini default: `gemini-2.5-flash`."
+        },
+        "diffspark.ai.openaiBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "markdownDescription": "Base URL for the OpenAI provider. Change it to use an OpenAI-compatible endpoint (for example Azure OpenAI, OpenRouter or a local server)."
+        }
+      }
+    },
     "menus": {
+      "commandPalette": [
+        { "command": "bitbucketPrReviewer.improveDiffComment", "when": "false" },
+        { "command": "bitbucketPrReviewer.improveDiffCommentWith", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiSuggestionReplace", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiSuggestionInsert", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiSuggestionRetry", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiSuggestionDiscard", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiDraftPost", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiDraftImprove", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiDraftImproveWith", "when": "false" },
+        { "command": "bitbucketPrReviewer.aiDraftDelete", "when": "false" }
+      ],
       "comments/commentThread/context": [
         {
           "command": "bitbucketPrReviewer.createDiffComment",
-          "group": "inline",
+          "group": "inline@1",
           "when": "commentController == diffspark && commentThreadIsEmpty"
         },
         {
           "command": "bitbucketPrReviewer.replyDiffComment",
-          "group": "inline",
+          "group": "inline@1",
           "when": "commentController == diffspark && !commentThreadIsEmpty"
+        },
+        {
+          "command": "bitbucketPrReviewer.improveDiffComment",
+          "group": "inline@2",
+          "when": "commentController == diffspark"
+        },
+        {
+          "command": "bitbucketPrReviewer.improveDiffCommentWith",
+          "group": "inline@3",
+          "when": "commentController == diffspark"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionReplace",
+          "group": "inline@1",
+          "when": "commentController == diffspark && comment == diffsparkAiSuggestion"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionInsert",
+          "group": "inline@2",
+          "when": "commentController == diffspark && comment == diffsparkAiSuggestion"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionRetry",
+          "group": "inline@3",
+          "when": "commentController == diffspark && comment == diffsparkAiSuggestion"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionDiscard",
+          "group": "inline@4",
+          "when": "commentController == diffspark && comment == diffsparkAiSuggestion"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftPost",
+          "group": "inline@1",
+          "when": "commentController == diffspark && comment == diffsparkAiDraft"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftImprove",
+          "group": "inline@2",
+          "when": "commentController == diffspark && comment == diffsparkAiDraft"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftImproveWith",
+          "group": "inline@3",
+          "when": "commentController == diffspark && comment == diffsparkAiDraft"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftDelete",
+          "group": "inline@4",
+          "when": "commentController == diffspark && comment == diffsparkAiDraft"
         }
       ],
       "editor/title": [

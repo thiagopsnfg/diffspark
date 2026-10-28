@@ -11,6 +11,9 @@ import {
   ChangedFile,
   PullRequestComment,
 } from "./bitbucket/types";
+import { CommentImprover } from "./ai/service";
+import { pickImproveOptions } from "./ai/actionPicker";
+import { buildCodeSnippet, describeImproveOptions, ImproveOptions } from "./ai/prompt";
 
 const EMAIL_SECRET = "bitbucket-pr-reviewer.email";
 const TOKEN_SECRET = "bitbucket-pr-reviewer.api-token";
@@ -66,9 +69,33 @@ interface DiffComment extends vscode.Comment {
   bitbucketId: number;
 }
 
+type AiCommentKind = "loading" | "suggestion" | "draft";
+
+interface AiComment extends vscode.Comment {
+  ai: {
+    kind: AiCommentKind;
+    thread: vscode.CommentThread;
+    original: string;
+    options: ImproveOptions;
+  };
+}
+
+const AI_CONTEXT_VALUES: Record<AiCommentKind, string> = {
+  loading: "diffsparkAiLoading",
+  suggestion: "diffsparkAiSuggestion",
+  draft: "diffsparkAiDraft",
+};
+
+const isAiComment = (comment: vscode.Comment | undefined): comment is AiComment =>
+  Boolean(comment && (comment as AiComment).ai);
+
+const commentText = (comment: vscode.Comment): string =>
+  typeof comment.body === "string" ? comment.body : comment.body.value;
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("DiffSpark");
   context.subscriptions.push(output);
+  const improver = new CommentImprover(context.secrets);
 
   let client: BitbucketClient | undefined;
   let jiraClient: JiraClient | undefined;
@@ -456,24 +483,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  const postDiffComment = async (reply: vscode.CommentReply): Promise<void> => {
-    if (!reply.text.trim()) {
-      return;
+  const postDiffComment = async (thread: vscode.CommentThread, text: string): Promise<boolean> => {
+    if (!text.trim()) {
+      return false;
     }
-    const metadata = diffMetadata.get(reply.thread.uri.toString());
+    const metadata = diffMetadata.get(thread.uri.toString());
     if (!metadata) {
       throw new Error("The pull request diff for this comment is no longer available.");
     }
-    const firstComment = reply.thread.comments[0] as DiffComment | undefined;
+    const firstComment = thread.comments.find((comment) => !isAiComment(comment)) as DiffComment | undefined;
     const parentId = firstComment?.bitbucketId;
-    const line = reply.thread.range?.start.line;
+    const line = thread.range?.start.line;
     if (parentId === undefined && line === undefined) {
       throw new Error("Could not determine the line for this pull request comment.");
     }
     const created = await getClient().createComment(
       metadata.bitbucketRepository,
       metadata.pullRequestId,
-      reply.text,
+      text,
       parentId,
       parentId === undefined
         ? {
@@ -482,17 +509,216 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
         : undefined,
     );
-    reply.thread.comments = [...reply.thread.comments, toDiffComment(created)];
+    const posted = thread.comments.filter((comment) => !isAiComment(comment));
+    const drafts = thread.comments.filter(isAiComment);
+    thread.comments = [...posted, toDiffComment(created), ...drafts];
+    return true;
+  };
+
+  const aiAuthorIcon = vscode.Uri.joinPath(context.extensionUri, "resources", "diffspark-icon.png");
+
+  const setAiComment = (
+    thread: vscode.CommentThread,
+    kind: AiCommentKind,
+    text: string,
+    original: string,
+    options: ImproveOptions,
+  ): void => {
+    const loadingBody = new vscode.MarkdownString(
+      `$(loading~spin) **${describeImproveOptions(options)}** with ${improver.getProviderLabel()}…`,
+      true,
+    );
+    const comment: AiComment = {
+      body: kind === "loading" ? loadingBody : text,
+      mode: kind === "loading" ? vscode.CommentMode.Preview : vscode.CommentMode.Editing,
+      author: {
+        name: kind === "draft" ? "Draft · not posted" : "Improve comment",
+        iconPath: aiAuthorIcon,
+      },
+      label: kind === "suggestion" ? `AI suggestion · ${describeImproveOptions(options)}` : undefined,
+      contextValue: AI_CONTEXT_VALUES[kind],
+      ai: { kind, thread, original, options },
+    };
+    thread.comments = [...thread.comments.filter((item) => !isAiComment(item)), comment];
+  };
+
+  const removeAiComments = (thread: vscode.CommentThread): void => {
+    thread.comments = thread.comments.filter((item) => !isAiComment(item));
+  };
+
+  const improveInThread = async (
+    thread: vscode.CommentThread,
+    original: string,
+    options: ImproveOptions,
+    fallback: { kind: AiCommentKind; text: string; original: string; options: ImproveOptions },
+  ): Promise<void> => {
+    if (!original.trim()) {
+      void vscode.window.showInformationMessage("DiffSpark: Write your comment first, then use \"Improve comment\".");
+      return;
+    }
+    const metadata = diffMetadata.get(thread.uri.toString());
+    const line = thread.range?.start.line ?? 0;
+    const lines = (diffContents.get(thread.uri.toString()) ?? "").split(/\r?\n/);
+    const discussion = thread.comments
+      .filter((item) => !isAiComment(item))
+      .map((item) => `${item.author.name}: ${commentText(item)}`);
+
+    setAiComment(thread, "loading", "", original, options);
+    try {
+      const suggestion = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `DiffSpark: ${describeImproveOptions(options)} with ${improver.getProviderLabel()}…`,
+          cancellable: true,
+        },
+        (_progress, token) =>
+          improver.improve(
+            {
+              ...options,
+              comment: original,
+              filePath: metadata?.path,
+              codeSnippet: lines.length > 1 || lines[0] ? buildCodeSnippet(lines, line) : undefined,
+              discussion,
+            },
+            token,
+          ),
+      );
+      setAiComment(thread, "suggestion", suggestion, original, options);
+    } catch (error) {
+      setAiComment(thread, fallback.kind, fallback.text, fallback.original, fallback.options);
+      if (!(error instanceof vscode.CancellationError)) {
+        throw error;
+      }
+    }
+  };
+
+  const improveFromReply = async (reply: vscode.CommentReply, pick: boolean): Promise<void> => {
+    const text = reply.text;
+    if (!text.trim()) {
+      void vscode.window.showInformationMessage("DiffSpark: Write your comment first, then use \"Improve comment\".");
+      return;
+    }
+    const options: ImproveOptions | undefined = pick ? await pickImproveOptions() : { action: "improve" };
+    if (!options) {
+      // The reply box is cleared after this command returns, so keep the text as an editable draft.
+      setAiComment(reply.thread, "draft", text, text, { action: "improve" });
+      return;
+    }
+    await improveInThread(reply.thread, text, options, { kind: "draft", text, original: text, options });
+  };
+
+  const improveFromDraft = async (comment: AiComment, pick: boolean): Promise<void> => {
+    const text = commentText(comment);
+    const options: ImproveOptions | undefined = pick ? await pickImproveOptions() : { action: "improve" };
+    if (!options) {
+      setAiComment(comment.ai.thread, "draft", text, text, comment.ai.options);
+      return;
+    }
+    await improveInThread(comment.ai.thread, text, options, { kind: "draft", text, original: text, options });
   };
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.createDiffComment",
-      (reply: vscode.CommentReply) => runAction(() => postDiffComment(reply)),
+      (reply: vscode.CommentReply) => runAction(async () => {
+        await postDiffComment(reply.thread, reply.text);
+      }),
     ),
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.replyDiffComment",
-      (reply: vscode.CommentReply) => runAction(() => postDiffComment(reply)),
+      (reply: vscode.CommentReply) => runAction(async () => {
+        await postDiffComment(reply.thread, reply.text);
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.improveDiffComment",
+      (reply: vscode.CommentReply) => runAction(() => improveFromReply(reply, false)),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.improveDiffCommentWith",
+      (reply: vscode.CommentReply) => runAction(() => improveFromReply(reply, true)),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiSuggestionReplace",
+      (comment: AiComment) => runAction(async () => {
+        const text = commentText(comment);
+        try {
+          if (await postDiffComment(comment.ai.thread, text)) {
+            removeAiComments(comment.ai.thread);
+          } else {
+            setAiComment(comment.ai.thread, "suggestion", text, comment.ai.original, comment.ai.options);
+          }
+        } catch (error) {
+          setAiComment(comment.ai.thread, "suggestion", text, comment.ai.original, comment.ai.options);
+          throw error;
+        }
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiSuggestionInsert",
+      (comment: AiComment) => runAction(async () => {
+        const text = `${comment.ai.original.trimEnd()}\n\n${commentText(comment).trim()}`;
+        setAiComment(comment.ai.thread, "draft", text, text, comment.ai.options);
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiSuggestionRetry",
+      (comment: AiComment) => runAction(() =>
+        improveInThread(comment.ai.thread, comment.ai.original, comment.ai.options, {
+          kind: "suggestion",
+          text: commentText(comment),
+          original: comment.ai.original,
+          options: comment.ai.options,
+        }),
+      ),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiSuggestionDiscard",
+      (comment: AiComment) => runAction(async () => {
+        setAiComment(comment.ai.thread, "draft", comment.ai.original, comment.ai.original, comment.ai.options);
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiDraftPost",
+      (comment: AiComment) => runAction(async () => {
+        const text = commentText(comment);
+        try {
+          if (await postDiffComment(comment.ai.thread, text)) {
+            removeAiComments(comment.ai.thread);
+          } else {
+            setAiComment(comment.ai.thread, "draft", text, text, comment.ai.options);
+          }
+        } catch (error) {
+          setAiComment(comment.ai.thread, "draft", text, text, comment.ai.options);
+          throw error;
+        }
+      }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiDraftImprove",
+      (comment: AiComment) => runAction(() => improveFromDraft(comment, false)),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiDraftImproveWith",
+      (comment: AiComment) => runAction(() => improveFromDraft(comment, true)),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.aiDraftDelete",
+      (comment: AiComment) => runAction(async () => {
+        removeAiComments(comment.ai.thread);
+      }),
+    ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.selectAiProvider", () =>
+      runAction(async () => {
+        await improver.selectProvider();
+      }),
+    ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.setAiApiKey", () =>
+      runAction(async () => {
+        if (await improver.setApiKey()) {
+          void vscode.window.showInformationMessage("DiffSpark: API key saved.");
+        }
+      }),
     ),
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.openChangedFile",
@@ -713,6 +939,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => provider.refresh(),
             getJiraClient,
             ensureJiraClient,
+            improver,
           );
         }),
     ),

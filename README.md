@@ -19,6 +19,29 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
 - **Request changes** uses Bitbucket's native change-request status and can optionally post a Markdown comment explaining what to adjust.
 - The merge dialog lets you choose a strategy, edit the commit message, and optionally close the source branch.
 - When Jira is connected, the merge dialog finds Jira issue keys in the PR title, description, and source branch. Select which issues to transition and their target statuses; Jira transitions run after the Bitbucket merge succeeds.
+- **Improve comment** (AI): works like Jira's *Improve description*. Write a comment, click **Improve comment**, and review an editable AI suggestion. The default makes it clearer, more polite, and more objective, and adds an example when it helps. The suggestion keeps your comment's language. The AI actions dropdown offers **Improve formatting**, **Fix spelling and grammar**, **Remix**, **Change tone** (professional, empathetic, casual, neutral, educational), **Make shorter**, **Make longer**, **Add code example**, and **Translate options**. See [Improve comment with AI](#improve-comment-with-ai).
+
+## Improve comment with AI
+
+- **Pull request view**: the comment box has a toolbar with **Improve comment** and an AI dropdown (✦ ▾). The suggestion appears below the box, where you can edit it and then choose **Replace**, **Insert below**, **Try again**, or **Discard**. Use **Stop** to cancel a running request.
+- **Diff inline comments**: next to **Comment**/**Reply** there are **Improve comment** and **AI actions ▾** buttons. The suggestion appears in the thread as an editable *AI suggestion* with **Replace & post**, **Insert below**, **Try again**, and **Discard**.
+  - VS Code clears its native comment box after any button runs, so your original text is never lost. **Discard** and **Insert below** turn it into an editable *Draft* that you can **Post**, **Improve** again, or **Delete**.
+- Context sent to the AI:
+  - always: your draft comment;
+  - for inline comments: the file path, about 17 lines of code around the commented line, and the earlier messages in the thread;
+  - in the pull request view: the PR title and description, plus the parent discussion for replies.
+
+Providers (run **DiffSpark: Select AI Provider**):
+
+| Provider | Setup |
+| --- | --- |
+| GitHub Copilot (default) | Uses the VS Code Language Model API and your Copilot subscription. No API key. VS Code asks once to allow DiffSpark to use Copilot. |
+| OpenAI | Run **DiffSpark: Set AI API Key**. Default model `gpt-4o-mini`. `diffspark.ai.openaiBaseUrl` lets you use any OpenAI-compatible endpoint (HTTPS, or HTTP on localhost). |
+| Google Gemini | Run **DiffSpark: Set AI API Key** with a [Google AI Studio](https://aistudio.google.com/apikey) key. Default model `gemini-2.5-flash`. |
+
+- API keys are stored in VS Code `SecretStorage`.
+- `diffspark.ai.model` overrides the model: a Copilot model family, or an OpenAI/Gemini model name.
+- Privacy: your draft comment and the context listed above are sent to the selected provider.
 
 ## Setup
 
@@ -74,3 +97,5 @@ Errors are logged in **Output → DiffSpark**.
 - **HTTP 401** — the email or API token is wrong or expired. Run **DiffSpark: Connect** again.
 - **HTTP 403 when expanding a pull request's files** — the token is missing `read:repository:bitbucket`.
 - **Review buttons don't reflect an existing approval or change request** — the token is missing `read:user:bitbucket`.
+- **Improve comment says GitHub Copilot is not available** — sign in to GitHub Copilot in VS Code, or switch providers with **DiffSpark: Select AI Provider**.
+- **Improve comment fails with HTTP 401/403** — the OpenAI/Gemini API key is wrong. Run **DiffSpark: Set AI API Key**.
