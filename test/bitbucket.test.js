@@ -1,8 +1,8 @@
-const assert = require("node:assert/strict");
 const test = require("node:test");
+const assert = require("node:assert/strict");
+const { buildFileTree } = require("../dist/bitbucket/tree");
 const { BitbucketClient } = require("../dist/bitbucket/client");
 const { parseBitbucketRemoteUrl } = require("../dist/bitbucket/repository");
-const { buildFileTree } = require("../dist/bitbucket/tree");
 const { renderMarkdown, sanitizeCommentHtml } = require("../dist/views/markdown");
 
 const repository = {

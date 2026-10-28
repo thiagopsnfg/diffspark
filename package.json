@@ -13,9 +13,9 @@
     "Source Control"
   ],
   "keywords": [
+    "review",
     "bitbucket",
-    "pull request",
-    "review"
+    "pull request"
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
@@ -25,8 +25,8 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "bitbucketPrReviewer",
           "title": "DiffSpark",
+          "id": "bitbucketPrReviewer",
           "icon": "resources/diffspark-icon.svg"
         }
       ]
@@ -34,58 +34,59 @@
     "views": {
       "bitbucketPrReviewer": [
         {
-          "id": "bitbucketPrReviewer.pullRequests",
-          "name": "Pull Requests"
+          "name": "Pull Requests",
+          "icon": "resources/diffspark-icon.svg",
+          "id": "bitbucketPrReviewer.pullRequests"
         }
       ]
     },
     "commands": [
       {
-        "command": "bitbucketPrReviewer.connect",
-        "title": "DiffSpark: Connect"
+        "title": "DiffSpark: Connect",
+        "command": "bitbucketPrReviewer.connect"
       },
       {
-        "command": "bitbucketPrReviewer.refresh",
-        "title": "DiffSpark: Refresh"
+        "title": "DiffSpark: Refresh",
+        "command": "bitbucketPrReviewer.refresh"
       },
       {
-        "command": "bitbucketPrReviewer.selectRepository",
-        "title": "DiffSpark: Select Repository"
+        "title": "DiffSpark: Select Repository",
+        "command": "bitbucketPrReviewer.selectRepository"
       },
       {
-        "command": "bitbucketPrReviewer.filterPullRequests",
-        "title": "DiffSpark: Filter Pull Requests"
+        "title": "DiffSpark: Filter Pull Requests",
+        "command": "bitbucketPrReviewer.filterPullRequests"
       },
       {
-        "command": "bitbucketPrReviewer.sortPullRequests",
-        "title": "DiffSpark: Sort Pull Requests"
+        "title": "DiffSpark: Sort Pull Requests",
+        "command": "bitbucketPrReviewer.sortPullRequests"
       },
       {
-        "command": "bitbucketPrReviewer.openPullRequest",
-        "title": "DiffSpark: Open Pull Request"
+        "title": "DiffSpark: Open Pull Request",
+        "command": "bitbucketPrReviewer.openPullRequest"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "group": "navigation",
           "command": "bitbucketPrReviewer.refresh",
-          "when": "view == bitbucketPrReviewer.pullRequests",
-          "group": "navigation"
+          "when": "view == bitbucketPrReviewer.pullRequests"
         },
         {
-          "command": "bitbucketPrReviewer.filterPullRequests",
+          "group": "navigation",
           "when": "view == bitbucketPrReviewer.pullRequests",
-          "group": "navigation"
+          "command": "bitbucketPrReviewer.filterPullRequests"
         },
         {
+          "group": "navigation",
           "command": "bitbucketPrReviewer.sortPullRequests",
-          "when": "view == bitbucketPrReviewer.pullRequests",
-          "group": "navigation"
+          "when": "view == bitbucketPrReviewer.pullRequests"
         },
         {
+          "group": "navigation",
           "command": "bitbucketPrReviewer.selectRepository",
-          "when": "view == bitbucketPrReviewer.pullRequests",
-          "group": "navigation"
+          "when": "view == bitbucketPrReviewer.pullRequests"
         }
       ]
     }
