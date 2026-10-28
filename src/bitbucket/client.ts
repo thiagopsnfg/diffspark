@@ -5,6 +5,7 @@ import {
   MergeStrategy,
   PullRequest,
   PullRequestComment,
+  PullRequestInlineComment,
   PullRequestPage,
   PullRequestSort,
   PullRequestState,
@@ -98,8 +99,47 @@ export class BitbucketClient {
 
     return entries.flatMap((entry) => {
       const filePath = entry.new?.path ?? entry.old?.path;
-      return filePath ? [{ path: filePath, status: entry.status }] : [];
+      return filePath ? [{
+        path: filePath,
+        status: entry.status,
+        ...(entry.old?.path ? { oldPath: entry.old.path } : {}),
+        ...(entry.new?.path ? { newPath: entry.new.path } : {}),
+      }] : [];
     });
+  }
+
+  async getFileComparison(
+    repository: BitbucketRepository,
+    pullRequestId: number,
+    file: ChangedFile,
+  ): Promise<{ before: string; after: string }> {
+    const pullRequest = await this.request<PullRequest>(
+      new URL(this.pullRequestPath(repository, pullRequestId, ""), API_ORIGIN).toString(),
+      { method: "GET" },
+    );
+    const sourceHash = pullRequest.source.commit?.hash;
+    const destinationHash = pullRequest.destination.commit?.hash;
+    if (!sourceHash || !destinationHash) {
+      throw new Error("Bitbucket did not return the pull request commit hashes.");
+    }
+    const sourceFullName = pullRequest.source.repository?.full_name ?? repository.fullName;
+    const [workspace, slug] = sourceFullName.split("/");
+    const sourceRepository = { workspace, slug, fullName: sourceFullName };
+    const base = file.status === "added" ? undefined : await this.request<{ hash: string }>(
+      new URL(this.repositoryPath(repository, `/merge-base/${encodeURIComponent(destinationHash)}..${encodeURIComponent(sourceHash)}`), API_ORIGIN).toString(),
+      { method: "GET" },
+    );
+    const [before, after] = await Promise.all([
+      base ? this.getFileContent(repository, base.hash, file.oldPath ?? file.path) : "",
+      file.status === "removed" ? "" : this.getFileContent(sourceRepository, sourceHash, file.newPath ?? file.path),
+    ]);
+    return { before, after };
+  }
+
+  private getFileContent(repository: BitbucketRepository, commit: string, path: string): Promise<string> {
+    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+    const url = new URL(this.repositoryPath(repository, `/src/${encodeURIComponent(commit)}/${encodedPath}`), API_ORIGIN);
+    return this.request<string>(url.toString(), { method: "GET", raw: true });
   }
 
   getComments(repository: BitbucketRepository, pullRequestId: number): Promise<PullRequestComment[]> {
@@ -112,6 +152,7 @@ export class BitbucketClient {
     pullRequestId: number,
     markdown: string,
     parentId?: number,
+    inline?: PullRequestInlineComment,
   ): Promise<PullRequestComment> {
     const path = this.pullRequestPath(repository, pullRequestId, "/comments");
     return this.request(new URL(path, API_ORIGIN).toString(), {
@@ -119,12 +160,18 @@ export class BitbucketClient {
       body: {
         content: { raw: markdown },
         ...(parentId === undefined ? {} : { parent: { id: parentId } }),
+        ...(inline === undefined ? {} : { inline }),
       },
     });
   }
 
   approve(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
     const path = this.pullRequestPath(repository, pullRequestId, "/approve");
+    return this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" });
+  }
+
+  requestChanges(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
+    const path = this.pullRequestPath(repository, pullRequestId, "/request-changes");
     return this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" });
   }
 
@@ -204,6 +251,9 @@ export class BitbucketClient {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw new Error(this.formatApiError(response));
+    }
+    if (options.raw) {
+      return response.body as T;
     }
     if (!response.body.trim()) {
       return undefined as T;

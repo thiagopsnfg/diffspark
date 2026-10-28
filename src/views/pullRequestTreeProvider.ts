@@ -3,6 +3,7 @@ import { BitbucketClient } from "../bitbucket/client";
 import { buildFileTree, FileTreeNode } from "../bitbucket/tree";
 import {
   BitbucketRepository,
+  ChangedFile,
   PullRequest,
   PullRequestSort,
   PullRequestState,
@@ -25,7 +26,14 @@ export class PullRequestNode extends vscode.TreeItem {
 }
 
 class PathNode extends vscode.TreeItem {
-  constructor(readonly fileNode: FileTreeNode) {
+  constructor(
+    readonly fileNode: FileTreeNode,
+    readonly repository: BitbucketRepository,
+    readonly pullRequestId: number,
+    readonly files: Map<string, ChangedFile>,
+    readonly sourceBranch: string,
+    readonly sourceRepositoryFullName?: string,
+  ) {
     super(
       fileNode.name,
       fileNode.kind === "directory"
@@ -33,8 +41,26 @@ class PathNode extends vscode.TreeItem {
         : vscode.TreeItemCollapsibleState.None,
     );
     this.tooltip = fileNode.path;
-    this.iconPath = new vscode.ThemeIcon(fileNode.kind === "directory" ? "folder" : "file");
+    // resourceUri + ThemeIcon.File/Folder lets VS Code render icons from the active file icon theme.
+    this.resourceUri = vscode.Uri.from({
+      scheme: "diffspark-tree",
+      path: `/${repository.fullName}/${pullRequestId}/${fileNode.path}`,
+    });
+    this.iconPath = fileNode.kind === "directory" ? vscode.ThemeIcon.Folder : vscode.ThemeIcon.File;
     this.contextValue = fileNode.kind === "directory" ? "bitbucketChangedFolder" : "bitbucketChangedFile";
+    if (fileNode.kind === "file") {
+      this.command = {
+        command: "bitbucketPrReviewer.openChangedFile",
+        title: "Open File Changes",
+        arguments: [
+          repository,
+          pullRequestId,
+          files.get(fileNode.path),
+          sourceBranch,
+          sourceRepositoryFullName ?? repository.fullName,
+        ],
+      };
+    }
   }
 }
 
@@ -57,7 +83,14 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
 
   async getChildren(element?: TreeNode): Promise<TreeNode[]> {
     if (element instanceof PathNode) {
-      return element.fileNode.children.map((node) => new PathNode(node));
+      return element.fileNode.children.map((node) => new PathNode(
+        node,
+        element.repository,
+        element.pullRequestId,
+        element.files,
+        element.sourceBranch,
+        element.sourceRepositoryFullName,
+      ));
     }
 
     try {
@@ -68,7 +101,15 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
         }
         const files = await this.getClient().getChangedFiles(repository, element.pullRequest.id);
         const fileTree = buildFileTree(files.map((file) => file.path));
-        return fileTree.map((node) => new PathNode(node));
+        const filesByPath = new Map(files.map((file) => [file.path, file]));
+        return fileTree.map((node) => new PathNode(
+          node,
+          repository,
+          element.pullRequest.id,
+          filesByPath,
+          element.pullRequest.source.branch.name,
+          element.pullRequest.source.repository?.full_name,
+        ));
       }
 
       const repository = this.getRepository();

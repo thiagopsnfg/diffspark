@@ -148,8 +148,8 @@ test("reads diffstat paths and falls back to the old path for deleted files", as
   const client = new BitbucketClient("dev@example.com", "token", fake.transport);
 
   assert.deepEqual(await client.getChangedFiles(repository, 42), [
-    { path: "src/new.ts", status: "added" },
-    { path: "src/old.ts", status: "removed" },
+    { path: "src/new.ts", status: "added", newPath: "src/new.ts" },
+    { path: "src/old.ts", status: "removed", oldPath: "src/old.ts" },
   ]);
 });
 
@@ -166,7 +166,7 @@ test("follows the diffstat redirect to the repository diffstat endpoint", async 
   const client = new BitbucketClient("dev@example.com", "token", fake.transport);
 
   assert.deepEqual(await client.getChangedFiles(repository, 42), [
-    { path: "src/components/task.js", status: "modified" },
+    { path: "src/components/task.js", status: "modified", newPath: "src/components/task.js" },
   ]);
   assert.equal(fake.calls.length, 2);
   assert.equal(new URL(fake.calls[0].url).pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/diffstat");
@@ -245,15 +245,107 @@ test("repeats writes only on method-preserving redirects", async () => {
   assert.equal(downgraded.calls.length, 1);
 });
 
+test("loads renamed file contents at the merge base and source commit, including forks", async () => {
+  const fake = fakeTransport([
+    { statusCode: 200, body: JSON.stringify({
+      source: { commit: { hash: "source" }, repository: { full_name: "fork/project" } },
+      destination: { commit: { hash: "destination" } },
+    }) },
+    { statusCode: 200, body: JSON.stringify({ hash: "base" }) },
+    { statusCode: 200, body: "const before = 1;\n" },
+    { statusCode: 200, body: "  \n" },
+  ]);
+  const result = await new BitbucketClient("dev@example.com", "token", fake.transport)
+    .getFileComparison(repository, 42, { path: "new #?.ts", oldPath: "old.ts", status: "renamed" });
+  assert.deepEqual(result, { before: "const before = 1;\n", after: "  \n" });
+  assert.match(fake.calls[1].url, /merge-base\/destination\.\.source$/);
+  assert.match(fake.calls[2].url, /iptv-dashboard\/src\/base\/old.ts$/);
+  assert.match(fake.calls[3].url, /fork\/project\/src\/source\/new%20%23%3F.ts$/);
+});
+
+test("uses an empty side for added and removed files without fetching a missing file", async () => {
+  for (const status of ["added", "removed"]) {
+    const responses = [
+      { statusCode: 200, body: JSON.stringify({
+        source: { commit: { hash: "source" } }, destination: { commit: { hash: "destination" } },
+      }) },
+      ...(status === "removed" ? [{ statusCode: 200, body: JSON.stringify({ hash: "base" }) }] : []),
+      { statusCode: 200, body: "content\n" },
+    ];
+    const fake = fakeTransport(responses);
+    const result = await new BitbucketClient("dev@example.com", "token", fake.transport)
+      .getFileComparison(repository, 42, { path: "file.ts", status });
+    assert.deepEqual(result, status === "added"
+      ? { before: "", after: "content\n" } : { before: "content\n", after: "" });
+    assert.equal(fake.calls.length, status === "added" ? 2 : 3);
+  }
+});
+
+test("nested changed files open a diff for their original repository and PR", async () => {
+  const Module = require("node:module");
+  const originalLoad = Module._load;
+  let PullRequestTreeProvider;
+  let PullRequestNode;
+  Module._load = function (id, ...args) {
+    if (id === "vscode") {
+      return {
+        TreeItem: class { constructor(label) { this.label = label; } },
+        TreeItemCollapsibleState: { None: 0, Collapsed: 1 },
+        ThemeIcon: class { static File = "file"; static Folder = "folder"; },
+        Uri: { from: (components) => components },
+        EventEmitter: class { fire() {} dispose() {} },
+      };
+    }
+    return originalLoad.call(this, id, ...args);
+  };
+  try {
+    ({ PullRequestTreeProvider, PullRequestNode } = require("../dist/views/pullRequestTreeProvider"));
+  } finally {
+    Module._load = originalLoad;
+  }
+  const file = { path: "src/nested/new.ts", oldPath: "src/old.ts", status: "renamed" };
+  let selectedRepository = repository;
+  const provider = new PullRequestTreeProvider(
+    () => ({ getChangedFiles: async () => [file] }),
+    () => selectedRepository,
+    (error) => { throw error; },
+  );
+  const pullRequest = new PullRequestNode({
+    id: 42, title: "Test", source: { branch: { name: "feature" } },
+    destination: { branch: { name: "main" } },
+  });
+  const [root] = await provider.getChildren(pullRequest);
+  assert.equal(root.command, undefined);
+  selectedRepository = { workspace: "other", slug: "other", fullName: "other/other" };
+  const [directory] = await provider.getChildren(root);
+  const [leaf] = await provider.getChildren(directory);
+  assert.equal(directory.iconPath, "folder");
+  assert.equal(leaf.iconPath, "file");
+  assert.equal(leaf.resourceUri.path, "/iptvplatform/iptv-dashboard/42/src/nested/new.ts");
+  assert.equal(leaf.command.command, "bitbucketPrReviewer.openChangedFile");
+  assert.deepEqual(leaf.command.arguments, [repository, 42, file, "feature", "iptvplatform/iptv-dashboard"]);
+  provider.dispose();
+});
+
 test("creates Markdown comments and threaded replies", async () => {
   const fake = fakeTransport([
     { statusCode: 201, body: JSON.stringify({ id: 10 }) },
     { statusCode: 201, body: JSON.stringify({ id: 11 }) },
+    { statusCode: 201, body: JSON.stringify({ id: 12 }) },
+    { statusCode: 201, body: JSON.stringify({ id: 13 }) },
   ]);
   const client = new BitbucketClient("dev@example.com", "token", fake.transport);
 
   await client.createComment(repository, 42, "**Please update this section.**");
   await client.createComment(repository, 42, "I pushed the fix.", 10);
+  await client.createComment(repository, 42, "This should be on the new line.", undefined, {
+    path: "src/file.ts",
+    to: 23,
+  });
+  await client.createComment(repository, 42, "This should be on the old line.", undefined, {
+    path: "src/old-file.ts",
+    from: 19,
+  });
 
   assert.deepEqual(JSON.parse(fake.calls[0].body), {
     content: { raw: "**Please update this section.**" },
@@ -261,6 +353,14 @@ test("creates Markdown comments and threaded replies", async () => {
   assert.deepEqual(JSON.parse(fake.calls[1].body), {
     content: { raw: "I pushed the fix." },
     parent: { id: 10 },
+  });
+  assert.deepEqual(JSON.parse(fake.calls[2].body), {
+    content: { raw: "This should be on the new line." },
+    inline: { path: "src/file.ts", to: 23 },
+  });
+  assert.deepEqual(JSON.parse(fake.calls[3].body), {
+    content: { raw: "This should be on the old line." },
+    inline: { path: "src/old-file.ts", from: 19 },
   });
 });
 
@@ -281,6 +381,17 @@ test("approves and merges through the supported PR endpoints", async () => {
     merge_strategy: "squash",
     close_source_branch: true,
   });
+});
+
+test("requests changes through the supported PR endpoint", async () => {
+  const fake = fakeTransport([{ statusCode: 200, body: "" }]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  await client.requestChanges(repository, 42);
+
+  assert.equal(new URL(fake.calls[0].url).pathname, "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/request-changes");
+  assert.equal(fake.calls[0].method, "POST");
+  assert.equal(fake.calls[0].body, undefined);
 });
 
 test("surfaces API errors and invalid JSON responses", async () => {

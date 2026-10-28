@@ -47,30 +47,78 @@
     "commands": [
       {
         "title": "DiffSpark: Connect",
-        "command": "bitbucketPrReviewer.connect"
+        "command": "bitbucketPrReviewer.connect",
+        "icon": "$(plug)"
       },
       {
         "title": "DiffSpark: Refresh",
-        "command": "bitbucketPrReviewer.refresh"
+        "command": "bitbucketPrReviewer.refresh",
+        "icon": "$(refresh)"
       },
       {
         "title": "DiffSpark: Select Repository",
-        "command": "bitbucketPrReviewer.selectRepository"
+        "command": "bitbucketPrReviewer.selectRepository",
+        "icon": "$(repo)"
       },
       {
         "title": "DiffSpark: Filter Pull Requests",
-        "command": "bitbucketPrReviewer.filterPullRequests"
+        "command": "bitbucketPrReviewer.filterPullRequests",
+        "icon": "$(filter)"
       },
       {
         "title": "DiffSpark: Sort Pull Requests",
-        "command": "bitbucketPrReviewer.sortPullRequests"
+        "command": "bitbucketPrReviewer.sortPullRequests",
+        "icon": "$(sort-precedence)"
       },
       {
         "title": "DiffSpark: Open Pull Request",
-        "command": "bitbucketPrReviewer.openPullRequest"
+        "command": "bitbucketPrReviewer.openPullRequest",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "title": "Abrir arquivo",
+        "command": "bitbucketPrReviewer.openWorkspaceFile",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "title": "Abrir arquivo no destino",
+        "command": "bitbucketPrReviewer.openFileOnPrBranch",
+        "icon": "$(git-branch)"
+      },
+      {
+        "title": "Comment",
+        "command": "bitbucketPrReviewer.createDiffComment"
+      },
+      {
+        "title": "Reply",
+        "command": "bitbucketPrReviewer.replyDiffComment"
       }
     ],
     "menus": {
+      "comments/commentThread/context": [
+        {
+          "command": "bitbucketPrReviewer.createDiffComment",
+          "group": "inline",
+          "when": "commentController == diffspark && commentThreadIsEmpty"
+        },
+        {
+          "command": "bitbucketPrReviewer.replyDiffComment",
+          "group": "inline",
+          "when": "commentController == diffspark && !commentThreadIsEmpty"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "bitbucketPrReviewer.openWorkspaceFile",
+          "group": "navigation@1",
+          "when": "isInDiffEditor && resourceScheme == diffspark"
+        },
+        {
+          "command": "bitbucketPrReviewer.openFileOnPrBranch",
+          "group": "navigation@2",
+          "when": "isInDiffEditor && resourceScheme == diffspark"
+        }
+      ],
       "view/title": [
         {
           "group": "navigation",

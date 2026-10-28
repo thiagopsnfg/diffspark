@@ -20,11 +20,14 @@ export interface PullRequest {
     display_name?: string;
   };
   source: {
+    commit?: { hash: string };
+    repository?: { full_name: string };
     branch: {
       name: string;
     };
   };
   destination: {
+    commit?: { hash: string };
     branch: {
       name: string;
     };
@@ -42,6 +45,7 @@ export interface PullRequestComment {
     raw?: string;
     html?: string;
   };
+  inline?: PullRequestInlineComment;
   parent?: {
     id: number;
   };
@@ -51,9 +55,17 @@ export interface PullRequestComment {
   };
 }
 
+export interface PullRequestInlineComment {
+  path: string;
+  from?: number;
+  to?: number;
+}
+
 export interface ChangedFile {
   path: string;
   status?: string;
+  oldPath?: string;
+  newPath?: string;
 }
 
 export interface PullRequestPage<T> {
@@ -66,6 +78,7 @@ export type MergeStrategy = "merge_commit" | "squash" | "fast_forward";
 export interface RequestOptions {
   method?: "GET" | "POST";
   body?: unknown;
+  raw?: boolean;
 }
 
 export interface TransportResponse {
