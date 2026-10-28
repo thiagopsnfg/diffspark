@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { BitbucketClient } from "./bitbucket/client";
+import { JiraClient } from "./jira/client";
 import { parseBitbucketRemoteUrl } from "./bitbucket/repository";
 import { PullRequestWebview } from "./views/pullRequestWebview";
 import { PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
@@ -13,6 +14,9 @@ import {
 
 const EMAIL_SECRET = "bitbucket-pr-reviewer.email";
 const TOKEN_SECRET = "bitbucket-pr-reviewer.api-token";
+const JIRA_SITE_SECRET = "bitbucket-pr-reviewer.jira-site";
+const JIRA_EMAIL_SECRET = "bitbucket-pr-reviewer.jira-email";
+const JIRA_TOKEN_SECRET = "bitbucket-pr-reviewer.jira-api-token";
 const PULL_REQUEST_STATES: PullRequestState[] = ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"];
 
 interface GitRemote {
@@ -67,6 +71,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(output);
 
   let client: BitbucketClient | undefined;
+  let jiraClient: JiraClient | undefined;
   let selectedRepository: RepositoryCandidate | undefined;
   let treeView: vscode.TreeView<unknown> | undefined;
 
@@ -76,12 +81,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void vscode.window.showErrorMessage(`DiffSpark: ${message}`);
   };
 
+  const [jiraSiteUrl, jiraEmail, jiraApiToken] = await Promise.all([
+    context.secrets.get(JIRA_SITE_SECRET),
+    context.secrets.get(JIRA_EMAIL_SECRET),
+    context.secrets.get(JIRA_TOKEN_SECRET),
+  ]);
+  if (jiraSiteUrl && jiraEmail && jiraApiToken) {
+    try {
+      jiraClient = new JiraClient(jiraSiteUrl, jiraEmail, jiraApiToken);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
   const getClient = (): BitbucketClient => {
     if (!client) {
       throw new Error("Connect to Bitbucket before loading pull requests.");
     }
     return client;
   };
+
+  const getJiraClient = (): JiraClient | undefined => jiraClient;
 
   const getSelectedBitbucketRepository = (): BitbucketRepository | undefined =>
     selectedRepository?.bitbucket;
@@ -134,6 +154,82 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     client = new BitbucketClient(email.trim(), apiToken);
     treeView.message = undefined;
     return true;
+  };
+
+  const connectJira = async (): Promise<boolean> => {
+    const siteUrl = await vscode.window.showInputBox({
+      prompt: "Jira Cloud site URL",
+      placeHolder: "https://example.atlassian.net",
+      ignoreFocusOut: true,
+      value: await context.secrets.get(JIRA_SITE_SECRET),
+      validateInput: (value) => {
+        try {
+          const site = new URL(value.trim());
+          return site.protocol === "https:" &&
+            site.hostname.endsWith(".atlassian.net") &&
+            !site.port &&
+            !site.username &&
+            !site.password &&
+            !site.search &&
+            !site.hash &&
+            (site.pathname === "/" || site.pathname === "")
+            ? undefined
+            : "Enter a Jira Cloud site URL such as https://example.atlassian.net.";
+        } catch {
+          return "Enter a valid Jira Cloud site URL.";
+        }
+      },
+    });
+    if (siteUrl === undefined) {
+      return false;
+    }
+
+    const email = await vscode.window.showInputBox({
+      prompt: "Jira account email",
+      placeHolder: "name@example.com",
+      ignoreFocusOut: true,
+      value: await context.secrets.get(JIRA_EMAIL_SECRET),
+      validateInput: (value) => value.includes("@") ? undefined : "Enter a valid account email.",
+    });
+    if (email === undefined) {
+      return false;
+    }
+
+    const apiToken = await vscode.window.showInputBox({
+      prompt: "Jira API token",
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (value) => value.trim() ? undefined : "Enter an API token.",
+    });
+    if (apiToken === undefined) {
+      return false;
+    }
+
+    const normalizedSiteUrl = siteUrl.trim().replace(/\/+$/, "");
+    const normalizedEmail = email.trim();
+    const connectedClient = new JiraClient(normalizedSiteUrl, normalizedEmail, apiToken);
+    await context.secrets.store(JIRA_SITE_SECRET, normalizedSiteUrl);
+    await context.secrets.store(JIRA_EMAIL_SECRET, normalizedEmail);
+    await context.secrets.store(JIRA_TOKEN_SECRET, apiToken);
+    jiraClient = connectedClient;
+    void vscode.window.showInformationMessage("DiffSpark: Jira connected.");
+    return true;
+  };
+
+  const ensureJiraClient = async (): Promise<boolean> => {
+    if (jiraClient) {
+      return true;
+    }
+    const [siteUrl, email, apiToken] = await Promise.all([
+      context.secrets.get(JIRA_SITE_SECRET),
+      context.secrets.get(JIRA_EMAIL_SECRET),
+      context.secrets.get(JIRA_TOKEN_SECRET),
+    ]);
+    if (siteUrl && email && apiToken) {
+      jiraClient = new JiraClient(siteUrl, email, apiToken);
+      return true;
+    }
+    return connectJira();
   };
 
   const ensureClient = async (): Promise<boolean> => {
@@ -508,6 +604,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }),
     ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.connectJira", () =>
+      runAction(async () => {
+        await connectJira();
+      }),
+    ),
     vscode.commands.registerCommand("bitbucketPrReviewer.refresh", () =>
       runAction(refresh),
     ),
@@ -576,6 +677,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             getClient(),
             reportError,
             () => provider.refresh(),
+            getJiraClient,
+            ensureJiraClient,
           );
         }),
     ),

@@ -2,10 +2,22 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { BitbucketClient } from "../bitbucket/client";
 import { BitbucketRepository, MergeStrategy, PullRequest, PullRequestComment } from "../bitbucket/types";
+import { JiraClient, JiraTransition } from "../jira/client";
+import { extractJiraIssueKeys } from "../jira/issues";
 import { renderMarkdown, sanitizeCommentHtml } from "./markdown";
+
+interface MergeIssueOption {
+  key: string;
+  summary: string;
+  issueType: string;
+  transitions: JiraTransition[];
+  error?: string;
+}
 
 export class PullRequestWebview {
   private disposed = false;
+  private hasRequestedChanges = false;
+  private readonly availableTransitions = new Map<string, Set<string>>();
   private readonly panel: vscode.WebviewPanel;
 
   private constructor(
@@ -14,6 +26,8 @@ export class PullRequestWebview {
     private readonly client: BitbucketClient,
     private readonly onError: (error: unknown) => void,
     private readonly onMerged: () => void,
+    private readonly getJiraClient: () => JiraClient | undefined,
+    private readonly ensureJiraClient: () => Promise<boolean>,
   ) {
     this.panel = vscode.window.createWebviewPanel(
       "bitbucketPullRequest",
@@ -35,8 +49,18 @@ export class PullRequestWebview {
     client: BitbucketClient,
     onError: (error: unknown) => void,
     onMerged: () => void,
+    getJiraClient: () => JiraClient | undefined,
+    ensureJiraClient: () => Promise<boolean>,
   ): Promise<PullRequestWebview> {
-    const view = new PullRequestWebview(pullRequest, repository, client, onError, onMerged);
+    const view = new PullRequestWebview(
+      pullRequest,
+      repository,
+      client,
+      onError,
+      onMerged,
+      getJiraClient,
+      ensureJiraClient,
+    );
     await view.refresh();
     return view;
   }
@@ -51,6 +75,9 @@ export class PullRequestWebview {
   private async handleMessage(message: unknown): Promise<void> {
     if (!isWebviewMessage(message)) {
       this.onError(new Error("Received an invalid pull request view message."));
+      if (message && typeof message === "object" && "command" in message && message.command === "merge") {
+        await this.panel.webview.postMessage({ command: "mergeFailed" });
+      }
       return;
     }
 
@@ -63,8 +90,22 @@ export class PullRequestWebview {
         await this.requestChanges();
         return;
       }
+      if (message.command === "loadMergeOptions") {
+        await this.loadMergeOptions();
+        return;
+      }
+      if (message.command === "connectJira") {
+        await this.ensureJiraClient();
+        await this.loadMergeOptions();
+        return;
+      }
       if (message.command === "merge") {
-        await this.merge(message.strategy, message.closeSourceBranch);
+        await this.merge(
+          message.strategy,
+          message.closeSourceBranch,
+          message.commitMessage,
+          message.transitions,
+        );
         return;
       }
 
@@ -84,6 +125,11 @@ export class PullRequestWebview {
       }
     } catch (error) {
       this.onError(error);
+      if (message.command === "merge") {
+        await this.panel.webview.postMessage({ command: "mergeFailed" });
+      } else if (message.command === "connectJira") {
+        await this.loadMergeOptions();
+      }
     }
   }
 
@@ -113,6 +159,8 @@ export class PullRequestWebview {
       return;
     }
     await this.client.requestChanges(this.repository, this.pullRequest.id);
+    this.hasRequestedChanges = true;
+    await this.refresh();
     const comment = reason.trim();
     if (comment) {
       await this.client.createComment(this.repository, this.pullRequest.id, comment);
@@ -121,19 +169,102 @@ export class PullRequestWebview {
     await this.refresh();
   }
 
-  private async merge(strategy: MergeStrategy, closeSourceBranch: boolean): Promise<void> {
-    const choice = await vscode.window.showWarningMessage(
-      `Merge PR #${this.pullRequest.id}?\n${this.pullRequest.source.branch.name} → ${this.pullRequest.destination.branch.name}\nStrategy: ${strategy}\nClose source branch: ${closeSourceBranch ? "yes" : "no"}`,
-      { modal: true },
-      "Merge",
-    );
-    if (choice !== "Merge") {
+  private async loadMergeOptions(): Promise<void> {
+    const jira = this.getJiraClient();
+    this.availableTransitions.clear();
+    if (!jira) {
+      await this.panel.webview.postMessage({
+        command: "mergeOptions",
+        jiraConfigured: false,
+        issues: [],
+      });
       return;
     }
 
-    await this.client.merge(this.repository, this.pullRequest.id, strategy, closeSourceBranch);
-    void vscode.window.showInformationMessage(`Pull request #${this.pullRequest.id} merged.`);
+    const keys = extractJiraIssueKeys(this.pullRequest);
+    const issues = await Promise.all(keys.map(async (key): Promise<MergeIssueOption> => {
+      const [issueResult, transitionsResult] = await Promise.allSettled([
+        jira.getIssue(key),
+        jira.getTransitions(key),
+      ]);
+      if (issueResult.status === "rejected") {
+        return {
+          key,
+          summary: key,
+          issueType: "",
+          transitions: [],
+          error: errorMessage(issueResult.reason),
+        };
+      }
+      if (transitionsResult.status === "rejected") {
+        return {
+          ...issueResult.value,
+          transitions: [],
+          error: errorMessage(transitionsResult.reason),
+        };
+      }
+      this.availableTransitions.set(
+        key,
+        new Set(transitionsResult.value.map((transition) => transition.id)),
+      );
+      return { ...issueResult.value, transitions: transitionsResult.value };
+    }));
+
+    if (!this.disposed) {
+      await this.panel.webview.postMessage({
+        command: "mergeOptions",
+        jiraConfigured: true,
+        issues,
+      });
+    }
+  }
+
+  private async merge(
+    strategy: MergeStrategy,
+    closeSourceBranch: boolean,
+    commitMessage: string,
+    transitions: { issueKey: string; transitionId: string }[],
+  ): Promise<void> {
+    if (!commitMessage.trim() || commitMessage.length > 10_000) {
+      throw new Error("The commit message must contain 1–10,000 characters.");
+    }
+    if (new Set(transitions.map(({ issueKey }) => issueKey)).size !== transitions.length) {
+      throw new Error("Select at most one transition per Jira issue.");
+    }
+    for (const transition of transitions) {
+      if (!this.availableTransitions.get(transition.issueKey)?.has(transition.transitionId)) {
+        throw new Error(`The selected Jira transition for ${transition.issueKey} is not available.`);
+      }
+    }
+
+    const jira = this.getJiraClient();
+    if (transitions.length > 0 && !jira) {
+      throw new Error("Connect to Jira before applying issue transitions.");
+    }
+
+    await this.client.merge(
+      this.repository,
+      this.pullRequest.id,
+      strategy,
+      closeSourceBranch,
+      commitMessage.trim(),
+    );
     this.onMerged();
+    const results = await Promise.allSettled(
+      transitions.map(({ issueKey, transitionId }) => jira!.transition(issueKey, transitionId)),
+    );
+    const failures = results.flatMap((result, index) =>
+      result.status === "rejected"
+        ? [`${transitions[index].issueKey}: ${errorMessage(result.reason)}`]
+        : [],
+    );
+    void vscode.window.showInformationMessage(`Pull request #${this.pullRequest.id} merged.`);
+    if (failures.length > 0) {
+      void vscode.window.showWarningMessage(
+        `The pull request was merged, but these Jira transitions failed: ${failures.join(" · ")}`,
+      );
+    }
+    await this.panel.webview.postMessage({ command: "mergeComplete" });
   }
 
   private render(comments: PullRequestComment[]): string {
@@ -142,6 +273,11 @@ export class PullRequestWebview {
     const state = this.pullRequest.draft
       ? "Draft"
       : this.pullRequest.state.charAt(0) + this.pullRequest.state.slice(1).toLowerCase();
+    const statusClass = this.pullRequest.draft
+      ? "status--draft"
+      : `status--${this.pullRequest.state.toLowerCase()}`;
+    const defaultCommitMessage =
+      `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
     const renderedComments = comments.map((comment) => {
       const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
       const content = comment.content?.raw
@@ -171,6 +307,10 @@ export class PullRequestWebview {
     .pr-kicker, .meta, .branches, .actions, .composer-actions { display: flex; align-items: center; gap: .65rem; flex-wrap: wrap; }
     .pr-kicker { gap: .5rem; }
     .status { display: inline-flex; align-items: center; padding: .12rem .55rem; border: 1px solid var(--vscode-panel-border); border-radius: 999px; color: var(--vscode-badge-foreground); background: var(--vscode-badge-background); font-size: .85em; font-weight: 600; }
+    .status--open, .status--merged { color: var(--vscode-testing-iconPassed); border-color: var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-testing-iconPassed) 12%, transparent); }
+    .status--declined { color: var(--vscode-testing-iconFailed); border-color: var(--vscode-testing-iconFailed); background: color-mix(in srgb, var(--vscode-testing-iconFailed) 12%, transparent); }
+    .status--draft { color: var(--vscode-textLink-foreground); border-color: var(--vscode-textLink-foreground); background: color-mix(in srgb, var(--vscode-textLink-foreground) 12%, transparent); }
+    .status--superseded { color: var(--vscode-descriptionForeground); }
     .meta { margin: 0; }
     .branches { margin-top: 1rem; }
     .branch { display: inline-flex; max-width: 100%; padding: .25rem .6rem; border: 1px solid var(--vscode-panel-border); border-radius: 4px; background: var(--vscode-sideBar-background); font-family: var(--vscode-editor-font-family); font-size: .9em; overflow-wrap: anywhere; }
@@ -198,25 +338,50 @@ export class PullRequestWebview {
     .markdown th { background: var(--vscode-editor-background); }
     .empty-state { color: var(--vscode-descriptionForeground); }
     textarea { box-sizing: border-box; width: 100%; min-height: 7rem; resize: vertical; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 5px; padding: .7rem; font: inherit; }
-    textarea:focus, select:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+    select:focus, input:focus, textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
     button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 4px; padding: .5rem .85rem; font: inherit; cursor: pointer; }
     button:hover { background: var(--vscode-button-hoverBackground); }
     button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
     button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    button.requested { color: var(--vscode-editorWarning-foreground); border: 1px solid var(--vscode-editorWarning-foreground); }
     select { color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border); border-radius: 4px; padding: .45rem .6rem; font: inherit; }
     label { color: var(--vscode-descriptionForeground); font-size: .9em; }
+    dialog { box-sizing: border-box; width: min(540px, calc(100vw - 2rem)); max-height: min(90vh, 760px); padding: 1.25rem 1.4rem; overflow: auto; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: 10px; box-shadow: 0 12px 32px #0008; }
+    dialog::backdrop { background: #0009; }
+    .merge-title { margin: 0 0 1rem; font-size: 1.2rem; }
+    .merge-field { margin: .65rem 0; }
+    .merge-field > label, .merge-field > .field-label { display: block; margin-bottom: .35rem; color: var(--vscode-descriptionForeground); font-size: .9em; }
+    .merge-branch { display: inline-block; max-width: 100%; padding: .2rem .5rem; border-radius: 4px; background: var(--vscode-editor-background); font-size: .9em; overflow-wrap: anywhere; }
+    .merge-dialog textarea { min-height: 6.4rem; }
+    .jira-issues { display: grid; gap: .55rem; }
+    .jira-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto minmax(120px, auto); align-items: center; gap: .55rem; }
+    .jira-issue { min-width: 0; display: flex; align-items: center; gap: .4rem; }
+    .jira-type { flex: 0 0 auto; color: var(--vscode-descriptionForeground); font-size: .8em; }
+    .jira-type--bug { color: var(--vscode-testing-iconFailed); }
+    .jira-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .jira-key { flex: 0 0 auto; font-family: var(--vscode-editor-font-family); }
+    .jira-arrow { color: var(--vscode-descriptionForeground); }
+    .jira-error, .merge-hint { color: var(--vscode-descriptionForeground); font-size: .88em; }
+    .jira-error { grid-column: 2 / -1; overflow-wrap: anywhere; }
+    .transition--new { color: var(--vscode-descriptionForeground); border-color: var(--vscode-panel-border); }
+    .transition--indeterminate { color: var(--vscode-textLink-foreground); border-color: var(--vscode-textLink-foreground); }
+    .transition--done { color: var(--vscode-testing-iconPassed); border-color: var(--vscode-testing-iconPassed); }
+    .merge-footer { display: flex; justify-content: flex-end; gap: .6rem; margin-top: 1rem; }
+    .merge-footer button:disabled { opacity: .6; cursor: wait; }
     .composer-actions { margin-top: .75rem; }
     @media (max-width: 560px) {
       body { padding: 1rem .85rem 2rem; }
       .section { padding: .9rem; }
       .comment[data-reply="true"] { margin-left: .5rem; }
+      .jira-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+      .jira-row select { grid-column: 2 / -1; justify-self: start; max-width: 100%; }
     }
   </style>
 </head>
 <body>
   <header class="pr-header">
-    <div class="pr-kicker"><span class="status">${escapeHtml(state)}</span><span>Pull request #${this.pullRequest.id}</span></div>
+    <div class="pr-kicker"><span class="status ${statusClass}">${escapeHtml(state)}</span><span>Pull request #${this.pullRequest.id}</span></div>
     <h1>${escapeHtml(this.pullRequest.title)}</h1>
     <p class="meta">${escapeHtml(this.pullRequest.author?.display_name ?? "Unknown author")} opened this pull request · ${escapeHtml(formatDate(this.pullRequest.created_on))}</p>
     <div class="branches" aria-label="Source and destination branches">
@@ -229,13 +394,7 @@ export class PullRequestWebview {
     <div class="section-title"><h2>Review</h2><p>Choose an action for this pull request</p></div>
     <div class="actions">
       <button id="approve">Approve</button>
-      <button id="request-changes" class="secondary">Request changes</button>
-      <select id="merge-strategy" aria-label="Merge strategy">
-        <option value="merge_commit">Merge commit</option>
-        <option value="squash">Squash</option>
-        <option value="fast_forward">Fast forward</option>
-      </select>
-      <label><input id="close-source-branch" type="checkbox"> Close source branch</label>
+      <button id="request-changes" class="secondary${this.hasRequestedChanges ? " requested" : ""}">Request changes</button>
       <button id="merge" class="secondary">Merge…</button>
     </div>
   </section>
@@ -252,12 +411,47 @@ export class PullRequestWebview {
     <textarea id="comment-input" maxlength="10000" placeholder="Write a Markdown comment…"></textarea>
     <div class="composer-actions"><button id="send-comment">Comment</button><button id="cancel-reply" class="secondary" hidden>Cancel reply</button></div>
   </section>
+  <dialog id="merge-dialog" class="merge-dialog">
+    <h2 class="merge-title">Merge pull request</h2>
+    <div class="merge-field"><span class="field-label">Source</span><span class="merge-branch">${escapeHtml(this.pullRequest.source.branch.name)}</span></div>
+    <div class="merge-field"><span class="field-label">Destination</span><span class="merge-branch">${escapeHtml(this.pullRequest.destination.branch.name)}</span></div>
+    <div class="merge-field">
+      <label for="merge-strategy">Merge strategy</label>
+      <select id="merge-strategy" aria-label="Merge strategy">
+        <option value="merge_commit">Merge commit</option>
+        <option value="squash">Squash</option>
+        <option value="fast_forward">Fast forward</option>
+      </select>
+    </div>
+    <div class="merge-field">
+      <label for="merge-message">Commit message</label>
+      <textarea id="merge-message">${escapeHtml(defaultCommitMessage)}</textarea>
+    </div>
+    <div class="merge-field">
+      <span class="field-label">Transition work item</span>
+      <div id="jira-status" class="merge-hint" aria-live="polite">Loading Jira issues…</div>
+      <div id="jira-issues" class="jira-issues"></div>
+      <button id="connect-jira" class="secondary" hidden>Connect Jira</button>
+    </div>
+    <div class="merge-field">
+      <label><input id="close-source-branch" type="checkbox"> Close source branch</label>
+    </div>
+    <div class="merge-footer">
+      <button id="cancel-merge" class="secondary" type="button">Cancel</button>
+      <button id="confirm-merge" type="button">Merge</button>
+    </div>
+  </dialog>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const input = document.getElementById("comment-input");
     const title = document.getElementById("composer-title");
     const send = document.getElementById("send-comment");
     const cancelReply = document.getElementById("cancel-reply");
+    const mergeDialog = document.getElementById("merge-dialog");
+    const mergeButton = document.getElementById("confirm-merge");
+    const jiraStatus = document.getElementById("jira-status");
+    const jiraIssues = document.getElementById("jira-issues");
+    const connectJira = document.getElementById("connect-jira");
     let replyTo;
     document.querySelectorAll(".reply").forEach((button) => button.addEventListener("click", () => {
       replyTo = Number(button.dataset.parent);
@@ -278,11 +472,127 @@ export class PullRequestWebview {
     document.getElementById("approve").addEventListener("click", () => vscode.postMessage({ command: "approve" }));
     document.getElementById("request-changes").addEventListener("click", () => vscode.postMessage({ command: "requestChanges" }));
     document.getElementById("merge").addEventListener("click", () => {
+      mergeDialog.showModal();
+      mergeButton.disabled = true;
+      jiraStatus.textContent = "Loading Jira issues…";
+      jiraIssues.replaceChildren();
+      connectJira.hidden = true;
+      vscode.postMessage({ command: "loadMergeOptions" });
+    });
+    document.getElementById("cancel-merge").addEventListener("click", () => mergeDialog.close());
+    mergeDialog.addEventListener("click", (event) => {
+      if (event.target === mergeDialog) mergeDialog.close();
+    });
+    connectJira.addEventListener("click", () => {
+      mergeButton.disabled = true;
+      jiraStatus.textContent = "Connect to Jira in the prompt…";
+      vscode.postMessage({ command: "connectJira" });
+    });
+    document.getElementById("confirm-merge").addEventListener("click", () => {
+      const selectedTransitions = Array.from(jiraIssues.querySelectorAll(".jira-row"))
+        .filter((row) => row.querySelector("input[type=checkbox]").checked)
+        .map((row) => ({
+          issueKey: row.dataset.issueKey,
+          transitionId: row.querySelector("select").value,
+        }));
       vscode.postMessage({
         command: "merge",
         strategy: document.getElementById("merge-strategy").value,
         closeSourceBranch: document.getElementById("close-source-branch").checked,
+        commitMessage: document.getElementById("merge-message").value,
+        transitions: selectedTransitions,
       });
+      mergeButton.disabled = true;
+    });
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (message.command === "mergeOptions") {
+        mergeButton.disabled = false;
+        connectJira.hidden = message.jiraConfigured;
+        if (!message.jiraConfigured) {
+          jiraStatus.textContent = "Connect Jira to load work items and available transitions.";
+          connectJira.hidden = false;
+          return;
+        }
+        if (message.issues.length === 0) {
+          jiraStatus.textContent = "No Jira issue keys found in the PR title, description, or source branch.";
+          return;
+        }
+        jiraStatus.textContent = "";
+        message.issues.forEach((issue) => {
+          const row = document.createElement("div");
+          row.className = "jira-row";
+          row.dataset.issueKey = issue.key;
+
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = issue.transitions.length > 0 && !issue.error;
+          checkbox.disabled = issue.transitions.length === 0 || Boolean(issue.error);
+          checkbox.setAttribute("aria-label", "Transition " + issue.key + " after merge");
+
+          const details = document.createElement("div");
+          details.className = "jira-issue";
+          const type = document.createElement("span");
+          type.className = "jira-type";
+          type.textContent = issue.issueType.toLowerCase().includes("bug") ? "🐞" : "◇";
+          if (issue.issueType.toLowerCase().includes("bug")) type.classList.add("jira-type--bug");
+          type.title = issue.issueType;
+          const key = document.createElement("strong");
+          key.className = "jira-key";
+          key.textContent = issue.key;
+          const summary = document.createElement("span");
+          summary.className = "jira-summary";
+          summary.textContent = issue.summary;
+          summary.title = issue.summary;
+          details.append(type, key, summary);
+
+          row.append(checkbox, details);
+          if (issue.transitions.length > 0) {
+            const select = document.createElement("select");
+            select.setAttribute("aria-label", "Status after merge for " + issue.key);
+            issue.transitions.forEach((transition) => {
+              const option = document.createElement("option");
+              option.value = transition.id;
+              option.textContent = transition.to.name;
+              option.dataset.category = transition.to.statusCategory?.key || "";
+              select.append(option);
+            });
+            const colorSelect = () => {
+              select.classList.remove("transition--new", "transition--indeterminate", "transition--done");
+              const category = select.selectedOptions[0]?.dataset.category;
+              if (category === "new" || category === "indeterminate" || category === "done") {
+                select.classList.add("transition--" + category);
+              }
+            };
+            select.addEventListener("change", colorSelect);
+            colorSelect();
+            const arrow = document.createElement("span");
+            arrow.className = "jira-arrow";
+            arrow.setAttribute("aria-hidden", "true");
+            arrow.textContent = "→";
+            row.append(arrow, select);
+          }
+          if (issue.error) {
+            const error = document.createElement("span");
+            error.className = "jira-error";
+            error.textContent = issue.error;
+            row.append(error);
+          } else if (issue.transitions.length === 0) {
+            const hint = document.createElement("span");
+            hint.className = "jira-error";
+            hint.textContent = "No available transitions.";
+            row.append(hint);
+          }
+          jiraIssues.append(row);
+        });
+      }
+      if (message.command === "mergeComplete") {
+        mergeButton.disabled = false;
+        mergeDialog.close();
+      }
+      if (message.command === "mergeFailed") {
+        mergeButton.disabled = false;
+      }
     });
   </script>
 </body>
@@ -295,20 +605,43 @@ type WebviewMessage =
   | { command: "reply"; markdown: string; parentId: number }
   | { command: "approve" }
   | { command: "requestChanges" }
-  | { command: "merge"; strategy: MergeStrategy; closeSourceBranch: boolean };
+  | { command: "loadMergeOptions" }
+  | { command: "connectJira" }
+  | {
+      command: "merge";
+      strategy: MergeStrategy;
+      closeSourceBranch: boolean;
+      commitMessage: string;
+      transitions: { issueKey: string; transitionId: string }[];
+    };
 
 function isWebviewMessage(message: unknown): message is WebviewMessage {
   if (!message || typeof message !== "object" || !("command" in message)) {
     return false;
   }
   const candidate = message as Record<string, unknown>;
-  if (candidate.command === "approve" || candidate.command === "requestChanges") {
+  if (
+    candidate.command === "approve" ||
+    candidate.command === "requestChanges" ||
+    candidate.command === "loadMergeOptions" ||
+    candidate.command === "connectJira"
+  ) {
     return true;
   }
   if (candidate.command === "merge") {
     return (
       (candidate.strategy === "merge_commit" || candidate.strategy === "squash" || candidate.strategy === "fast_forward") &&
-      typeof candidate.closeSourceBranch === "boolean"
+      typeof candidate.closeSourceBranch === "boolean" &&
+      typeof candidate.commitMessage === "string" &&
+      Array.isArray(candidate.transitions) &&
+      candidate.transitions.every((item) =>
+        Boolean(item) &&
+        typeof item === "object" &&
+        typeof item.issueKey === "string" &&
+        /^[A-Z][A-Z0-9_]*-\d+$/.test(item.issueKey) &&
+        typeof item.transitionId === "string" &&
+        /^\d+$/.test(item.transitionId),
+      )
     );
   }
   if (candidate.command === "comment") {
@@ -347,4 +680,8 @@ function formatDate(value?: string): string {
   }
   const timestamp = Date.parse(value);
   return Number.isNaN(timestamp) ? value : new Date(timestamp).toLocaleString();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -2,6 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { buildFileTree } = require("../dist/bitbucket/tree");
 const { BitbucketClient } = require("../dist/bitbucket/client");
+const { JiraClient } = require("../dist/jira/client");
+const { extractJiraIssueKeys } = require("../dist/jira/issues");
 const { parseBitbucketRemoteUrl } = require("../dist/bitbucket/repository");
 const { renderMarkdown, sanitizeCommentHtml } = require("../dist/views/markdown");
 
@@ -100,6 +102,92 @@ test("lists PRs using selected states and sort and filters drafts", async () => 
   assert.equal(requestUrl.searchParams.get("q"), 'state IN ("OPEN","MERGED")');
   assert.equal(requestUrl.searchParams.get("sort"), "created_on");
   assert.equal(fake.calls[0].headers.Authorization, `Basic ${Buffer.from("dev@example.com:secret-token").toString("base64")}`);
+});
+
+test("includes the custom commit message in the Bitbucket merge request", async () => {
+  const fake = fakeTransport([{ statusCode: 200, body: "" }]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+  await client.merge(repository, 42, "squash", true, "Merge PR #42");
+
+  assert.equal(fake.calls[0].method, "POST");
+  assert.equal(
+    fake.calls[0].url,
+    "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/merge",
+  );
+  assert.deepEqual(JSON.parse(fake.calls[0].body), {
+    merge_strategy: "squash",
+    close_source_branch: true,
+    message: "Merge PR #42",
+  });
+});
+
+test("extracts unique Jira keys from PR title, description, and source branch", () => {
+  assert.deepEqual(
+    extractJiraIssueKeys({
+      title: "ICS-4354: Update language selector",
+      description: "Also fixes APP_2-88 and ICS-4354.",
+      source: { branch: { name: "feature/APP_2-89-translation" } },
+    }),
+    ["ICS-4354", "APP_2-88", "APP_2-89"],
+  );
+});
+
+test("loads Jira issue metadata and transitions with authenticated Cloud API requests", async () => {
+  const fake = fakeTransport([
+    {
+      statusCode: 200,
+      body: JSON.stringify({
+        key: "ICS-4354",
+        fields: { summary: "Fix language selection", issuetype: { name: "Bug" } },
+      }),
+    },
+    {
+      statusCode: 200,
+      body: JSON.stringify({
+        transitions: [
+          { id: "31", name: "Start progress", to: { name: "In Progress", statusCategory: { key: "indeterminate" } } },
+          { id: "32", name: "Malformed", to: {} },
+        ],
+      }),
+    },
+  ]);
+  const client = new JiraClient("https://example.atlassian.net", "jira@example.com", "jira-token", fake.transport);
+
+  assert.deepEqual(await client.getIssue("ICS-4354"), {
+    key: "ICS-4354",
+    summary: "Fix language selection",
+    issueType: "Bug",
+  });
+  assert.deepEqual(await client.getTransitions("ICS-4354"), [
+    { id: "31", name: "Start progress", to: { name: "In Progress", statusCategory: { key: "indeterminate" } } },
+  ]);
+  assert.equal(new URL(fake.calls[0].url).pathname, "/rest/api/3/issue/ICS-4354");
+  assert.equal(new URL(fake.calls[0].url).searchParams.get("fields"), "summary,issuetype");
+  assert.equal(fake.calls[0].headers.Authorization, `Basic ${Buffer.from("jira@example.com:jira-token").toString("base64")}`);
+  assert.equal(new URL(fake.calls[1].url).pathname, "/rest/api/3/issue/ICS-4354/transitions");
+});
+
+test("posts Jira transition and refuses untrusted redirect targets", async () => {
+  const fake = fakeTransport([{ statusCode: 204, body: "" }]);
+  const client = new JiraClient("https://example.atlassian.net", "jira@example.com", "token", fake.transport);
+  await client.transition("ICS-4354", "31");
+  assert.equal(fake.calls[0].method, "POST");
+  assert.deepEqual(JSON.parse(fake.calls[0].body), { transition: { id: "31" } });
+
+  const unsafe = fakeTransport([
+    { statusCode: 302, body: "", location: "https://evil.example/steal" },
+  ]);
+  const unsafeClient = new JiraClient("https://example.atlassian.net", "jira@example.com", "token", unsafe.transport);
+  await assert.rejects(unsafeClient.getIssue("ICS-4354"), /redirected outside its REST API/);
+  assert.equal(unsafe.calls.length, 1);
+});
+
+test("rejects Jira URLs outside Jira Cloud", () => {
+  assert.throws(
+    () => new JiraClient("https://example.com", "jira@example.com", "token", async () => ({ statusCode: 200, body: "{}" })),
+    /Jira Cloud site URL/,
+  );
 });
 
 test("follows paginated links only within the Bitbucket REST API", async () => {

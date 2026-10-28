@@ -16,9 +16,8 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
 - The diff editor toolbar can open the file from the current checkout or check out the pull request source branch and open the file. Checking out warns before changing a dirty worktree; source branches from forks require that fork to be configured as a Git remote.
 - Shows the pull request description and Markdown comments, supports Markdown comments and threaded replies, and can approve, request changes, or merge.
 - **Request changes** uses Bitbucket's native change-request status and can optionally post a Markdown comment explaining what to adjust.
-- Requires confirmation before sending a merge request.
-
-Jira issue transitions are not implemented.
+- The merge dialog lets you choose a strategy, edit the commit message, and optionally close the source branch.
+- When Jira is connected, the merge dialog finds Jira issue keys in the PR title, description, and source branch. Select which issues to transition and their target statuses; Jira transitions run after the Bitbucket merge succeeds.
 
 ## Setup
 
@@ -28,8 +27,13 @@ Jira issue transitions are not implemented.
    - `read:pullrequest:bitbucket` — list pull requests and read or write comments.
    - `write:pullrequest:bitbucket` — approve, request changes, and merge pull requests.
    - `read:repository:bitbucket` — list changed files. Bitbucket redirects the pull request diffstat to the repository diffstat endpoint, which requires this scope.
+   - `write:repository:bitbucket` — close the source branch after merging.
 4. The credentials are stored in VS Code `SecretStorage`, not workspace settings or files.
 5. Open the **DiffSpark** activity bar view. Use its toolbar to refresh, select a repository, change filters, or sort.
+6. Jira transitions are optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL, Jira account email, and an [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens). The token is used with HTTPS Basic authentication and stored in VS Code `SecretStorage`.
+   - The Jira account needs **Browse Projects** and **Transition Issues** for each linked issue. Issue-level security must also allow the account to view the issue.
+   - Atlassian API tokens used by this extension do not have configurable permission scopes; they inherit the Jira account's permissions. For OAuth 2.0 integrations, Jira's classic scopes are `read:jira-work` (read issues and transitions) and `write:jira-work` (perform transitions), but this extension does not use OAuth.
+   - Only Jira Cloud site URLs ending in `.atlassian.net` are supported.
 
 If several Git repositories are open, the extension uses the repository containing the active editor when possible. Use **DiffSpark: Select Repository** to choose another one.
 
@@ -57,9 +61,8 @@ Reload VS Code, open the target repository, and run **DiffSpark: Connect**.
 
 - Bitbucket Cloud is supported; Bitbucket Data Center/Server is not supported.
 - Draft filtering depends on the draft metadata returned by Bitbucket Cloud.
-- Jira transitions are deferred rather than simulated.
 - Merge succeeds only when Bitbucket permissions, branch policies, and repository state allow it.
-- The merge panel lets you select a merge strategy and whether to close the source branch.
+- Jira transition failures are reported after a successful merge; they do not undo or mark the Bitbucket merge as failed.
 - Redirects are followed only within `https://api.bitbucket.org/2.0/` (up to 5), so your credentials are never sent to another host. Write requests are repeated only on method-preserving redirects (307/308).
 
 ## Troubleshooting

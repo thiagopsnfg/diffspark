@@ -51,6 +51,11 @@
         "icon": "$(plug)"
       },
       {
+        "title": "DiffSpark: Connect Jira",
+        "command": "bitbucketPrReviewer.connectJira",
+        "icon": "$(plug)"
+      },
+      {
         "title": "DiffSpark: Refresh",
         "command": "bitbucketPrReviewer.refresh",
         "icon": "$(refresh)"

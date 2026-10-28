@@ -180,11 +180,16 @@ export class BitbucketClient {
     pullRequestId: number,
     strategy: MergeStrategy,
     closeSourceBranch = false,
+    message?: string,
   ): Promise<void> {
     const path = this.pullRequestPath(repository, pullRequestId, "/merge");
     return this.request(new URL(path, API_ORIGIN).toString(), {
       method: "POST",
-      body: { merge_strategy: strategy, close_source_branch: closeSourceBranch },
+      body: {
+        merge_strategy: strategy,
+        close_source_branch: closeSourceBranch,
+        ...(message === undefined ? {} : { message }),
+      },
     });
   }
 
