@@ -35,6 +35,7 @@ interface GitRepositoryHandle {
     HEAD?: { name?: string };
     workingTreeChanges: unknown[];
     indexChanges: unknown[];
+    onDidChange?: vscode.Event<void>;
   };
   fetch(remote?: string, ref?: string): Promise<void>;
   checkout(treeish: string): Promise<void>;
@@ -42,6 +43,7 @@ interface GitRepositoryHandle {
 
 interface GitApi {
   repositories: GitRepositoryHandle[];
+  onDidOpenRepository?: vscode.Event<GitRepositoryHandle>;
 }
 
 interface GitExtensionExports {
@@ -367,6 +369,69 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     provider.refresh();
+  };
+
+  // Loads pull requests on startup using stored credentials, without prompting the user.
+  let autoLoading = false;
+  const autoLoad = async (): Promise<void> => {
+    if (selectedRepository || autoLoading) {
+      return;
+    }
+    autoLoading = true;
+    try {
+      if (!client) {
+        const [email, apiToken] = await Promise.all([
+          context.secrets.get(EMAIL_SECRET),
+          context.secrets.get(TOKEN_SECRET),
+        ]);
+        if (!email || !apiToken) {
+          return;
+        }
+        client = new BitbucketClient(email, apiToken);
+        treeView!.message = "Looking for a Bitbucket repository…";
+      }
+      const candidates = await getCandidates();
+      if (candidates.length === 0 || selectedRepository) {
+        return;
+      }
+      const activeUri = vscode.window.activeTextEditor?.document.uri;
+      selectedRepository = (activeUri
+        ? candidates.find((candidate) => containsUri(candidate.handle.rootUri, activeUri))
+        : undefined) ?? candidates[0];
+      treeView!.message = `${selectedRepository.bitbucket.fullName} · ${selectedRepository.remoteName}`;
+      provider.refresh();
+    } catch (error) {
+      output.appendLine(`[${new Date().toISOString()}] Auto-load failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`);
+    } finally {
+      autoLoading = false;
+    }
+  };
+
+  const watchGitRepositories = async (): Promise<void> => {
+    try {
+      const api = await getGitApi();
+      const watchRepository = (repository: GitRepositoryHandle): void => {
+        const subscription = repository.state.onDidChange?.(() => void autoLoad());
+        if (subscription) {
+          context.subscriptions.push(subscription);
+        }
+      };
+      api.repositories.forEach(watchRepository);
+      const openSubscription = api.onDidOpenRepository?.((repository) => {
+        watchRepository(repository);
+        void autoLoad();
+      });
+      if (openSubscription) {
+        context.subscriptions.push(openSubscription);
+      }
+    } catch (error) {
+      output.appendLine(`[${new Date().toISOString()}] ${
+        error instanceof Error ? error.message : String(error)
+      }`);
+    }
+    await autoLoad();
   };
 
   const diffContents = new Map<string, string>();
@@ -975,8 +1040,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       selectedRepository = undefined;
       treeView!.message = "Select a Bitbucket repository to load pull requests.";
       setAuthorFilter(undefined);
+      void autoLoad();
     }),
   );
+
+  void watchGitRepositories();
 }
 
 export function deactivate(): void {}
