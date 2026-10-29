@@ -306,6 +306,15 @@ npm test               # compile and run tests
 npm run test:coverage  # tests with coverage
 ```
 
+`npm install` activates the Husky Git hooks automatically:
+
+- **pre-commit** runs lint-staged to check and auto-fix staged TypeScript, JavaScript,
+  JSON, and JSONC files with Biome. Fixes are included in the commit.
+- **pre-push** runs `npm test` to compile the project and run the full test suite.
+
+If either hook fails, the commit or push is blocked. Run `npm run prepare` to
+reactivate the hooks in an existing checkout.
+
 Open the folder in VS Code and press <kbd>F5</kbd> to launch an Extension Development Host.
 
 To install a local build in another project:
