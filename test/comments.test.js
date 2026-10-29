@@ -12,6 +12,10 @@ const comments = [
   { id: 11, parent: { id: 10 }, content: { raw: "A reply" }, user: { display_name: "Ana", account_id: "me" } },
   { id: 12, deleted: true, content: { raw: "Must not appear" }, inline: { path: "app.js", to: 2 }, user: { account_id: "me" } },
   { id: 13, parent: { id: 10 }, content: { raw: "Another person's reply" }, user: { display_name: "Ana", account_id: "other" } },
+  { id: 14, deleted: true, content: { raw: "Deleted root" }, inline: { path: "app.js", to: 3 }, user: { account_id: "me" } },
+  { id: 15, parent: { id: 14 }, content: { raw: "Reply to deleted root" }, user: { account_id: "other" } },
+  { id: 16, parent: { id: 11 }, content: { raw: "Nested reply" }, user: { account_id: "other" } },
+  { id: 17, deleted: true, parent: { id: 10 }, content: { raw: "Deleted reply" }, user: { account_id: "me" } },
 ];
 
 function load(filename, overrides, cache = new Map()) {
@@ -72,7 +76,7 @@ function harness() {
       createCommentController: () => ({
         ...disposable,
         createCommentThread: (uri, range, comments) => {
-          const thread = { uri, range, comments, ...disposable };
+          const thread = { uri, range, comments, disposed: false, dispose() { this.disposed = true; } };
           threads.push(thread);
           return thread;
         },
@@ -143,7 +147,7 @@ function harness() {
       await commands.get("bitbucketPrReviewer.refresh")();
       await commands.get("bitbucketPrReviewer.openChangedFile")(repository, 42, { path: "app.js" }, "feature");
       assert.deepEqual(errors, []);
-      assert.equal(threads.length, 2);
+      assert.equal(threads.length, 3);
     },
     async openWebview() {
       const { PullRequestWebview } = load(path.join(root, "views/pullRequestWebview.js"), overrides);
@@ -309,10 +313,17 @@ test("tree provider carries Bitbucket avatar URLs into the sorted author list an
   provider.dispose();
 });
 
-test("native diff deletes published comments and replies, preserving the thread and drafts", async () => {
+test("native diff hides deleted comments and removes them from the thread after deletion", async () => {
   const h = harness();
   await h.openDiff();
-  const thread = h.threads[0];
+  const [thread, deletedOnlyThread, orphanThread] = h.threads;
+  assert.deepEqual(thread.comments.map((comment) => comment.bitbucketId), [10, 11, 13, 16]);
+  assert.equal(deletedOnlyThread.disposed, true);
+  assert.equal(orphanThread.disposed, false);
+  assert.deepEqual(orphanThread.comments.map((comment) => comment.bitbucketId), [15]);
+  assert.equal(orphanThread.range.start.line, 2);
+  assert.ok(h.threads.every((item) => item.comments.every((comment) => !/Deleted|Must not appear/.test(comment.body.value))));
+
   const rootComment = thread.comments[0];
   const reply = thread.comments[1];
   const draft = { body: "Unsent draft", ai: { kind: "draft" } };
@@ -320,18 +331,28 @@ test("native diff deletes published comments and replies, preserving the thread 
   assert.equal(rootComment.contextValue, "diffsparkOwnComment");
   assert.equal(reply.contextValue, "diffsparkOwnComment");
   assert.equal(thread.comments[2].contextValue, undefined);
-  assert.equal(h.threads[1].comments[0].contextValue, undefined);
-  assert.match(h.threads[1].comments[0].body.value, /Comment deleted/);
   await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(rootComment);
   assert.deepEqual(h.deletions, [[repository, 42, 10]]);
-  assert.match(thread.comments[0].body.value, /Comment deleted/);
-  assert.equal(thread.comments[0].contextValue, undefined);
-  assert.equal(thread.comments[1], reply);
-  assert.equal(thread.comments[3], draft);
+  assert.equal(thread.comments.includes(rootComment), false);
+  assert.equal(thread.comments[0], reply);
+  assert.equal(thread.comments.at(-1), draft);
   await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(reply);
   assert.deepEqual(h.deletions[1], [repository, 42, 11]);
-  assert.equal(thread.comments[3], draft);
+  assert.equal(thread.comments.includes(reply), false);
+  assert.equal(thread.comments.at(-1), draft);
+  assert.equal(thread.disposed, false);
   assert.deepEqual(h.errors, []);
+});
+
+test("native diff disposes a thread when its last comment is deleted", async () => {
+  const h = harness();
+  await h.openDiff();
+  await h.commands.get("bitbucketPrReviewer.replyDiffComment")({ thread: h.threads[2], text: "New comment" });
+  const thread = h.threads[2];
+  thread.comments = thread.comments.filter((comment) => comment.bitbucketId === 20);
+  await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(thread.comments[0]);
+  assert.deepEqual(h.deletions, [[repository, 42, 20]]);
+  assert.equal(thread.disposed, true);
 });
 
 test("native diff cancellation and API errors do not remove comments", async () => {
@@ -364,7 +385,8 @@ test("webview exposes deletion, validates messages, and updates without reloadin
   const html = h.panel.webview.html;
   assert.match(html, /data-comment-id="10"/);
   assert.match(html, /data-comment-id="11"/);
-  assert.doesNotMatch(html, /data-comment-id="12"|Must not appear/);
+  assert.doesNotMatch(html, /data-comment-id="1[247]"|Must not appear|Deleted root|Deleted reply|Comment deleted/);
+  assert.match(html, /Reply to deleted root/);
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
   assert.doesNotThrow(() => new vm.Script(script));
   for (const id of [0, -1, "10", 1.5, Number.MAX_SAFE_INTEGER + 1]) {
@@ -378,7 +400,7 @@ test("webview exposes deletion, validates messages, and updates without reloadin
   assert.deepEqual(h.deletions, [[repository, 42, 10]]);
   assert.deepEqual(h.messages, [{ command: "commentDeleted", commentId: 10 }]);
   assert.equal(h.panel.webview.html, html);
-  assert.equal(view.comments.find((comment) => comment.id === 10).deleted, true);
+  assert.equal(view.comments.some((comment) => comment.id === 10), false);
   assert.equal(view.comments.find((comment) => comment.id === 11).content.raw, "A reply");
   await view.handleMessage({ command: "deleteComment", commentId: 10 });
   assert.equal(h.deletions.length, 1);
@@ -395,7 +417,7 @@ test("webview cancellation and permission errors retain the published comment", 
   await view.handleMessage({ command: "deleteComment", commentId: 11 });
   assert.equal(h.errors[0].message, "Permission denied");
   assert.equal(h.messages.length, 0);
-  assert.equal(view.comments.find((comment) => comment.id === 11).deleted, undefined);
+  assert.equal(view.comments.find((comment) => comment.id === 11).content.raw, "A reply");
 });
 
 test("native diff does not allow deleting other people's comments with the same display name", async () => {

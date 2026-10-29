@@ -87,9 +87,9 @@ export class PullRequestWebview {
       this.client.getMyReviewState(this.repository, this.pullRequest.id),
     ]);
     this.reviewState = reviewState;
-    this.comments = comments;
+    this.comments = comments.filter((comment) => !comment.deleted);
     if (!this.disposed) {
-      this.panel.webview.html = this.render(comments);
+      this.panel.webview.html = this.render(this.comments);
     }
   }
 
@@ -222,9 +222,7 @@ export class PullRequestWebview {
         );
         if (choice === "Delete") {
           await this.client.deleteComment(this.repository, this.pullRequest.id, comment.id);
-          this.comments = this.comments.map((entry) =>
-            entry.id === comment.id ? { ...entry, deleted: true, content: undefined } : entry,
-          );
+          this.comments = this.comments.filter((entry) => entry.id !== comment.id);
           await this.panel.webview.postMessage({ command: "commentDeleted", commentId: comment.id });
         }
         return;
@@ -416,14 +414,14 @@ export class PullRequestWebview {
       `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
     const renderedComments = comments.map((comment) => {
       const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
-      const content = comment.deleted ? "<p><em>Comment deleted.</em></p>" : comment.content?.raw
+      const content = comment.content?.raw
         ? renderMarkdown(rawMarkdown)
         : sanitizeCommentHtml(rawMarkdown);
       const parentId = comment.parent?.id;
       const replyControl = parentId === undefined
         ? `<button class="secondary reply" data-parent="${comment.id}">Reply</button>`
         : "";
-      const deleteControl = comment.deleted ? "" :
+      const deleteControl =
         `<button class="secondary delete-comment" data-comment-id="${comment.id}" aria-label="Delete comment">Delete</button>`;
       return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
     }).join("");
@@ -901,11 +899,11 @@ export class PullRequestWebview {
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (message.command === "commentDeleted") {
-        const comment = document.getElementById("comment-" + message.commentId);
-        if (comment) {
-          comment.querySelector(".markdown").textContent = "Comment deleted.";
-          comment.querySelector(".delete-comment")?.remove();
+        document.getElementById("comment-" + message.commentId)?.remove();
+        if (replyTo === message.commentId) {
+          cancelReply.click();
         }
+        return;
       }
       if (message.command === "aiProvider") {
         document.getElementById("ai-provider-name").textContent = message.label;

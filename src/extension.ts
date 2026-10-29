@@ -505,13 +505,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const toDiffComment = (comment: PullRequestComment, thread: vscode.CommentThread, isOwnComment: boolean): DiffComment => ({
-    body: new vscode.MarkdownString(comment.deleted ? "_Comment deleted._" : comment.content?.raw ?? comment.content?.html ?? ""),
+    body: new vscode.MarkdownString(comment.content?.raw ?? comment.content?.html ?? ""),
     mode: vscode.CommentMode.Preview,
     author: { name: comment.user?.display_name ?? "Unknown" },
     ...(comment.created_on ? { timestamp: new Date(comment.created_on) } : {}),
     bitbucketId: comment.id,
     thread,
-    contextValue: !comment.deleted && isOwnComment ? "diffsparkOwnComment" : undefined,
+    contextValue: isOwnComment ? "diffsparkOwnComment" : undefined,
   });
 
   const loadInlineComments = async (
@@ -532,6 +532,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void vscode.window.showWarningMessage(`DiffSpark: ${message}`);
     }
     const threadByCommentId = new Map<number, vscode.CommentThread>();
+    const commentById = new Map(comments.map((comment) => [comment.id, comment]));
+    const isOwn = (comment: PullRequestComment): boolean =>
+      accountId !== undefined && comment.user?.account_id === accountId;
     const rootComments = comments.filter((comment) => !comment.parent);
 
     for (const comment of rootComments) {
@@ -551,22 +554,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         continue;
       }
       const uri = side === "after" ? right : left;
+      // Deleted roots still anchor the thread so their surviving replies stay on the right line.
       const thread = commentController.createCommentThread(
         uri,
         new vscode.Range(line - 1, 0, line - 1, 0),
         [],
       );
-      thread.comments = [toDiffComment(comment, thread, accountId !== undefined && comment.user?.account_id === accountId)];
+      thread.comments = comment.deleted ? [] : [toDiffComment(comment, thread, isOwn(comment))];
       threadByCommentId.set(comment.id, thread);
     }
 
+    const findRootId = (comment: PullRequestComment): number => {
+      const visited = new Set<number>();
+      let current = comment;
+      while (current.parent && !visited.has(current.id)) {
+        visited.add(current.id);
+        const parent = commentById.get(current.parent.id);
+        if (!parent) {
+          return current.parent.id;
+        }
+        current = parent;
+      }
+      return current.id;
+    };
+
     for (const comment of comments) {
-      if (!comment.parent) {
+      if (!comment.parent || comment.deleted) {
         continue;
       }
-      const thread = threadByCommentId.get(comment.parent.id);
+      const thread = threadByCommentId.get(findRootId(comment));
       if (thread) {
-        thread.comments = [...thread.comments, toDiffComment(comment, thread, accountId !== undefined && comment.user?.account_id === accountId)];
+        thread.comments = [...thread.comments, toDiffComment(comment, thread, isOwn(comment))];
+      }
+    }
+
+    for (const thread of threadByCommentId.values()) {
+      if (thread.comments.length === 0) {
+        thread.dispose();
       }
     }
   };
@@ -723,11 +747,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return;
         }
         await getClient().deleteComment(metadata.bitbucketRepository, metadata.pullRequestId, comment.bitbucketId);
-        comment.thread.comments = comment.thread.comments.map((item) =>
-          item === comment
-            ? { ...comment, body: new vscode.MarkdownString("_Comment deleted._"), contextValue: undefined }
-            : item,
-        );
+        const remaining = comment.thread.comments.filter((item) => item !== comment);
+        if (remaining.length === 0) {
+          comment.thread.dispose();
+        } else {
+          comment.thread.comments = remaining;
+        }
       }),
     ),
     vscode.commands.registerCommand(
