@@ -160,6 +160,10 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
     this.refresh();
   }
 
+  getLoadedPullRequests(): PullRequest[] {
+    return [...this.loadedPullRequests];
+  }
+
   getAuthors(): PullRequestAuthor[] {
     const authors = new Map<string, PullRequestAuthor>();
     for (const pullRequest of this.loadedPullRequests) {

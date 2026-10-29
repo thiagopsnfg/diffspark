@@ -14,6 +14,23 @@ import {
   isImproveTone,
   TRANSLATE_LANGUAGES,
 } from "../ai/prompt";
+import { AiReviewState } from "../ai/review/runner";
+import { AiReviewFinding, FindingStatus, REVIEW_SEVERITIES } from "../ai/review/types";
+import { categoryLabel, SEVERITY_LABELS, VERDICT_LABELS } from "../ai/review/parse";
+
+/** Bridge between the pull request view and the AI reviewer (implemented in extension.ts). */
+export interface AiReviewHost {
+  getState(): AiReviewState;
+  onDidChange(listener: () => void): vscode.Disposable;
+  run(): Promise<void>;
+  cancel(): void;
+  clear(): Promise<void>;
+  editRules(): Promise<void>;
+  openFinding(id: string): Promise<void>;
+  setFindingStatus(ids: string[], status: FindingStatus): Promise<void>;
+  postFindings(ids: string[]): Promise<number>;
+  postSummary(): Promise<void>;
+}
 
 interface MergeIssueOption {
   key: string;
@@ -24,6 +41,7 @@ interface MergeIssueOption {
 }
 
 export class PullRequestWebview {
+  private static readonly openViews = new Map<string, PullRequestWebview>();
   private disposed = false;
   private reviewState: ReviewState = "none";
   private readonly availableTransitions = new Map<string, Set<string>>();
@@ -40,6 +58,7 @@ export class PullRequestWebview {
     private readonly getJiraClient: () => JiraClient | undefined,
     private readonly ensureJiraClient: () => Promise<boolean>,
     private readonly improver: CommentImprover,
+    private readonly aiReview?: AiReviewHost,
   ) {
     this.panel = vscode.window.createWebviewPanel(
       "bitbucketPullRequest",
@@ -47,8 +66,13 @@ export class PullRequestWebview {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
+    const aiReviewSubscription = aiReview?.onDidChange(() => {
+      void this.pushAiReview();
+    });
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      PullRequestWebview.openViews.delete(this.viewKey);
+      aiReviewSubscription?.dispose();
       this.improveCancellation?.cancel();
       this.improveCancellation?.dispose();
     });
@@ -66,7 +90,13 @@ export class PullRequestWebview {
     getJiraClient: () => JiraClient | undefined,
     ensureJiraClient: () => Promise<boolean>,
     improver: CommentImprover,
+    aiReview?: AiReviewHost,
   ): Promise<PullRequestWebview> {
+    const existing = PullRequestWebview.openViews.get(`${repository.fullName}#${pullRequest.id}`);
+    if (existing && !existing.disposed) {
+      existing.panel.reveal?.();
+      return existing;
+    }
     const view = new PullRequestWebview(
       pullRequest,
       repository,
@@ -76,9 +106,73 @@ export class PullRequestWebview {
       getJiraClient,
       ensureJiraClient,
       improver,
+      aiReview,
     );
+    PullRequestWebview.openViews.set(view.viewKey, view);
     await view.refresh();
     return view;
+  }
+
+  private get viewKey(): string {
+    return `${this.repository.fullName}#${this.pullRequest.id}`;
+  }
+
+  private async pushAiReview(): Promise<void> {
+    if (!this.disposed && this.aiReview) {
+      await this.panel.webview.postMessage({ command: "aiReviewHtml", html: this.renderAiReview() });
+    }
+  }
+
+  private renderAiReview(): string {
+    return this.aiReview ? renderAiReviewSection(this.aiReview.getState(), this.pullRequest.source.commit?.hash) : "";
+  }
+
+  private async handleAiReviewMessage(
+    message: Extract<WebviewMessage, { command: "aiReview" | "aiReviewFindings" }>,
+  ): Promise<void> {
+    const host = this.aiReview;
+    if (!host) {
+      throw new Error("The AI review is not available in this view.");
+    }
+    if (message.command === "aiReview") {
+      switch (message.action) {
+        case "run":
+          await host.run();
+          return;
+        case "cancel":
+          host.cancel();
+          return;
+        case "clear":
+          await host.clear();
+          return;
+        case "editRules":
+          await host.editRules();
+          return;
+        case "postSummary":
+          await host.postSummary();
+          void vscode.window.showInformationMessage("DiffSpark: AI review summary posted as a comment.");
+          await this.refresh();
+          return;
+      }
+    }
+    switch (message.action) {
+      case "open":
+        await host.openFinding(message.ids[0]);
+        return;
+      case "dismiss":
+        await host.setFindingStatus(message.ids, "dismissed");
+        return;
+      case "restore":
+        await host.setFindingStatus(message.ids, "open");
+        return;
+      case "post":
+        try {
+          await host.postFindings(message.ids);
+        } finally {
+          await this.refresh();
+        }
+        return;
+    }
   }
 
   private async refresh(): Promise<void> {
@@ -195,6 +289,10 @@ export class PullRequestWebview {
         this.improveCancellation?.cancel();
         return;
       }
+      if (message.command === "aiReview" || message.command === "aiReviewFindings") {
+        await this.handleAiReviewMessage(message);
+        return;
+      }
       if (message.command === "configureAi") {
         await this.improver.selectProvider();
         await this.panel.webview.postMessage({ command: "aiProvider", label: this.improver.getProviderLabel() });
@@ -248,6 +346,8 @@ export class PullRequestWebview {
         await this.panel.webview.postMessage({ command: "mergeFailed" });
       } else if (message.command === "connectJira") {
         await this.loadMergeOptions();
+      } else if (message.command === "aiReview" || message.command === "aiReviewFindings") {
+        await this.pushAiReview();
       }
     }
   }
@@ -555,6 +655,36 @@ export class PullRequestWebview {
     .link-button { padding: 0; color: var(--vscode-textLink-foreground); background: transparent; }
     .link-button:hover { background: transparent; text-decoration: underline; }
     .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .ai-review-title { display: inline-flex; align-items: center; gap: .45rem; }
+    .ai-review-title svg { width: 16px; height: 16px; }
+    .ai-review-meta, .ai-review-hint { margin: .2rem 0 .75rem; color: var(--vscode-descriptionForeground); font-size: .88em; }
+    .ai-review-progress { display: flex; align-items: center; gap: .6rem; color: var(--vscode-descriptionForeground); }
+    .ai-review-progress .shimmer { flex: 1 1 auto; margin: 0; }
+    .ai-stale { padding: .45rem .65rem; border-left: 3px solid var(--vscode-editorWarning-foreground); background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 10%, transparent); font-size: .9em; }
+    .verdict { display: inline-flex; align-items: center; padding: .2rem .65rem; border: 1px solid currentColor; border-radius: 999px; font-weight: 600; font-size: .9em; }
+    .verdict--approve { color: var(--vscode-testing-iconPassed, #73c991); }
+    .verdict--comment { color: var(--vscode-textLink-foreground); }
+    .verdict--request_changes { color: var(--vscode-testing-iconFailed, #f14c4c); }
+    .ai-review-summary { margin: .75rem 0; }
+    .finding-group { margin: 1rem 0 .4rem; font-size: .95em; }
+    .finding { margin: .55rem 0 0; padding: .7rem .85rem; border: 1px solid var(--vscode-panel-border); border-left-width: 3px; border-radius: 6px; background: var(--vscode-editor-background); }
+    .finding--blocker { border-left-color: var(--vscode-testing-iconFailed, #f14c4c); }
+    .finding--major { border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
+    .finding--minor { border-left-color: var(--vscode-textLink-foreground); }
+    .finding--nit { border-left-color: var(--vscode-descriptionForeground); }
+    .finding[data-status="dismissed"], .finding[data-status="posted"] { opacity: .6; }
+    .finding header { display: flex; align-items: flex-start; justify-content: space-between; gap: .6rem; }
+    .finding header label { display: flex; align-items: flex-start; gap: .45rem; color: var(--vscode-foreground); font-size: 1em; }
+    .finding-tags { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: .35rem; }
+    .finding-tag { padding: .05rem .45rem; border: 1px solid var(--vscode-panel-border); border-radius: 999px; color: var(--vscode-descriptionForeground); font-size: .8em; white-space: nowrap; }
+    .finding-location { margin: .3rem 0; font-family: var(--vscode-editor-font-family); font-size: .88em; }
+    .finding .markdown { margin-top: .35rem; }
+    .finding .actions { margin-top: .5rem; }
+    .finding .actions button, .ai-review-actions button { padding: .32rem .7rem; }
+    .ai-review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; margin-top: 1rem; }
+    .ai-review-details { margin-top: .75rem; color: var(--vscode-descriptionForeground); font-size: .88em; }
+    .ai-review-details summary { cursor: pointer; }
+    .ai-review-details ul { margin: .35rem 0; padding-left: 1.3rem; }
     @media (prefers-reduced-motion: reduce) { .shimmer, .ai-improve.is-loading svg { animation: none; } }
     @media (max-width: 560px) {
       body { padding: 1rem .85rem 2rem; }
@@ -585,6 +715,7 @@ export class PullRequestWebview {
       <button id="merge" class="secondary">Merge…</button>
     </div>
   </section>
+  ${this.aiReview ? `<section class="section ai-review-section"><div id="ai-review">${this.renderAiReview()}</div></section>` : ""}
   <section class="section">
     <div class="section-title"><h2>Description</h2></div>
     <div class="markdown">${description || '<p class="empty-state">No description provided.</p>'}</div>
@@ -960,8 +1091,54 @@ export class PullRequestWebview {
       });
       mergeButton.disabled = true;
     });
+    const aiReview = document.getElementById("ai-review");
+    const updateAiSelection = () => {
+      const postSelected = aiReview && aiReview.querySelector('[data-ai-action="postSelected"]');
+      if (!postSelected) return;
+      const count = aiReview.querySelectorAll(".finding-select:checked").length;
+      postSelected.disabled = count === 0;
+      postSelected.textContent = count === 0 ? "Post selected" : "Post " + count + " selected as comments";
+    };
+    if (aiReview) {
+      aiReview.addEventListener("change", (event) => {
+        if (event.target.classList && event.target.classList.contains("finding-select")) updateAiSelection();
+      });
+      aiReview.addEventListener("click", (event) => {
+        const target = event.target.closest("[data-ai-action]");
+        if (!target || target.disabled) return;
+        const action = target.dataset.aiAction;
+        if (action === "postSelected") {
+          const ids = Array.from(aiReview.querySelectorAll(".finding-select:checked")).map((item) => item.value);
+          if (ids.length === 0) return;
+          target.disabled = true;
+          vscode.postMessage({ command: "aiReviewFindings", action: "post", ids });
+          return;
+        }
+        if (action === "open" || action === "dismiss" || action === "restore" || action === "post") {
+          if (action === "post") target.disabled = true;
+          vscode.postMessage({ command: "aiReviewFindings", action, ids: [target.dataset.id] });
+          return;
+        }
+        if (action === "approve") {
+          vscode.postMessage({ command: "approve" });
+          return;
+        }
+        if (action === "requestChanges") {
+          vscode.postMessage({ command: "requestChanges" });
+          return;
+        }
+        if (action === "run" || action === "postSummary") target.disabled = true;
+        vscode.postMessage({ command: "aiReview", action });
+      });
+      updateAiSelection();
+    }
     window.addEventListener("message", (event) => {
       const message = event.data;
+      if (message.command === "aiReviewHtml" && aiReview) {
+        aiReview.innerHTML = message.html;
+        updateAiSelection();
+        return;
+      }
       if (message.command === "mergeOptions") {
         mergeButton.disabled = false;
         connectJira.hidden = message.jiraConfigured;
@@ -1075,6 +1252,8 @@ type WebviewMessage =
     }
   | { command: "cancelImprove" }
   | { command: "configureAi" }
+  | { command: "aiReview"; action: "run" | "cancel" | "clear" | "editRules" | "postSummary" }
+  | { command: "aiReviewFindings"; action: "open" | "dismiss" | "restore" | "post"; ids: string[] }
   | {
       command: "merge";
       strategy: MergeStrategy;
@@ -1100,6 +1279,18 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
     candidate.command === "configureAi"
   ) {
     return true;
+  }
+  if (candidate.command === "aiReview") {
+    return ["run", "cancel", "clear", "editRules", "postSummary"].includes(candidate.action as string);
+  }
+  if (candidate.command === "aiReviewFindings") {
+    return (
+      ["open", "dismiss", "restore", "post"].includes(candidate.action as string) &&
+      Array.isArray(candidate.ids) &&
+      candidate.ids.length > 0 &&
+      candidate.ids.length <= 500 &&
+      candidate.ids.every((id) => typeof id === "string" && /^[\w-]{1,64}$/.test(id))
+    );
   }
   if (candidate.command === "improveComment") {
     return (
@@ -1193,6 +1384,102 @@ function renderAiMenu(providerLabel: string): string {
   }).join("");
   const footer = `<button type="button" class="ai-menu-item ai-menu-footer" role="menuitem" data-configure>${icon("gear")}<span>AI provider: <span id="ai-provider-name">${escapeHtml(providerLabel)}</span> · Change…</span></button>`;
   return `<div id="ai-menu" class="ai-menu" role="menu" aria-label="AI actions" hidden>${entries}<div class="ai-menu-separator" role="separator"></div>${footer}</div>`;
+}
+
+function renderAiReviewSection(state: AiReviewState, currentSourceCommit: string | undefined): string {
+  const result = state.result;
+  const button = (action: string, label: string, secondary = true, extra = ""): string =>
+    `<button type="button" class="${secondary ? "secondary" : ""}" data-ai-action="${action}"${extra}>${escapeHtml(label)}</button>`;
+  const headerActions = state.running
+    ? button("cancel", "Stop")
+    : `${button("run", result ? "Review again" : "Review with AI", Boolean(result))}${button("editRules", "Edit rules…")}`;
+  const parts = [
+    `<div class="section-title"><h2 class="ai-review-title">${AI_LOGO_SVG}AI review</h2><div class="actions">${headerActions}</div></div>`,
+  ];
+  if (state.running) {
+    parts.push(`<div class="ai-review-progress" role="status"><span>${escapeHtml(state.progress ?? "Reviewing…")}</span><div class="shimmer"></div></div>`);
+  }
+  if (state.error) {
+    parts.push(`<p class="ai-error" role="alert">${escapeHtml(state.error)}</p>`);
+  }
+  if (!result) {
+    if (!state.running) {
+      parts.push(
+        '<p class="empty-state">Let the AI go through every change in this pull request and point out bugs, risks and rule violations — or confirm that everything looks good. Nothing is posted until you choose to.</p>',
+        '<p class="ai-review-hint">Tip: use <strong>Edit rules…</strong> to tell the AI what your team cares about (Markdown files with optional <code>applyTo</code> globs). Repository instructions such as <code>AGENTS.md</code>, <code>.github/copilot-instructions.md</code> and <code>.github/instructions/*.instructions.md</code> are used too.</p>',
+      );
+    }
+    return parts.join("");
+  }
+
+  const meta = [
+    escapeHtml(result.provider),
+    escapeHtml(formatDate(result.createdAt)),
+    `${result.filesReviewed.length} ${result.filesReviewed.length === 1 ? "file" : "files"} reviewed`,
+    ...(result.filesSkipped.length > 0 ? [`${result.filesSkipped.length} skipped`] : []),
+  ];
+  parts.push(`<p class="ai-review-meta">${meta.join(" · ")}</p>`);
+  if (currentSourceCommit && result.sourceCommit && currentSourceCommit !== result.sourceCommit) {
+    parts.push('<p class="ai-stale">New commits were pushed after this review. Run it again to review the latest changes.</p>');
+  }
+  parts.push(`<span class="verdict verdict--${result.verdict}">${escapeHtml(VERDICT_LABELS[result.verdict])}</span>`);
+  if (result.summary) {
+    parts.push(`<div class="markdown ai-review-summary">${renderMarkdown(result.summary)}</div>`);
+  }
+
+  for (const severity of REVIEW_SEVERITIES) {
+    const findings = result.findings.filter((finding) => finding.severity === severity);
+    if (findings.length > 0) {
+      parts.push(`<h3 class="finding-group">${escapeHtml(SEVERITY_LABELS[severity])} (${findings.length})</h3>`, ...findings.map(renderFinding));
+    }
+  }
+
+  const actions: string[] = [];
+  if (result.findings.some((finding) => finding.status === "open")) {
+    actions.push(button("postSelected", "Post selected", false));
+  }
+  actions.push(button("postSummary", "Post summary as comment"));
+  if (result.verdict === "approve") {
+    actions.push(button("approve", "✅ Approve"));
+  } else if (result.verdict === "request_changes") {
+    actions.push(button("requestChanges", "⊖ Request changes"));
+  }
+  actions.push(button("clear", "Clear review"));
+  parts.push(`<div class="ai-review-actions">${actions.join("")}<span class="ai-disclaimer">AI-generated review may be inaccurate. Check before posting.</span></div>`);
+
+  const details: string[] = [];
+  if (result.rules.length > 0) {
+    details.push(`<details class="ai-review-details"><summary>Review rules applied (${result.rules.length})</summary><ul>${result.rules.map((rule) =>
+      `<li><code>${escapeHtml(rule.source)}</code>${rule.description ? ` — ${escapeHtml(rule.description)}` : ""}${rule.truncated ? " (truncated)" : ""}</li>`,
+    ).join("")}</ul></details>`);
+  } else {
+    details.push('<p class="ai-review-details">No review rules were applied. Use <strong>Edit rules…</strong> to add your team\'s guidelines.</p>');
+  }
+  if (result.filesSkipped.length > 0) {
+    details.push(`<details class="ai-review-details"><summary>Files not reviewed (${result.filesSkipped.length})</summary><ul>${result.filesSkipped.map((file) => `<li><code>${escapeHtml(file)}</code></li>`).join("")}</ul></details>`);
+  }
+  parts.push(...details);
+  return parts.join("");
+}
+
+function renderFinding(finding: AiReviewFinding): string {
+  const id = escapeHtml(finding.id);
+  const location = `${finding.file}${finding.line ? `:${finding.line}` : ""}`;
+  const selectable = finding.status === "open";
+  const checkbox = selectable
+    ? `<input type="checkbox" class="finding-select" value="${id}" checked aria-label="Select finding">`
+    : "";
+  const statusTag = finding.status === "open" ? "" : `<span class="finding-tag">${finding.status === "posted" ? "Posted" : "Dismissed"}</span>`;
+  const actions = finding.status === "open"
+    ? `<button type="button" data-ai-action="post" data-id="${id}">Post comment</button><button type="button" class="secondary" data-ai-action="dismiss" data-id="${id}">Dismiss</button>`
+    : finding.status === "dismissed"
+      ? `<button type="button" class="secondary" data-ai-action="restore" data-id="${id}">Restore</button>`
+      : "";
+  const suggestion = finding.suggestion
+    ? `<pre><code>${escapeHtml(finding.suggestion)}</code></pre>`
+    : "";
+  const body = finding.body && finding.body !== finding.title ? renderMarkdown(finding.body) : "";
+  return `<article class="finding finding--${finding.severity}" data-status="${finding.status}"><header><label>${checkbox}<strong>${escapeHtml(finding.title)}</strong></label><span class="finding-tags"><span class="finding-tag">${escapeHtml(categoryLabel(finding))}</span>${statusTag}</span></header><div class="finding-location"><button type="button" class="link-button" data-ai-action="open" data-id="${id}" title="Open in diff">${escapeHtml(location)}</button></div><div class="markdown">${body}${suggestion}</div><div class="actions">${actions}</div></article>`;
 }
 
 function escapeHtml(value: string): string {

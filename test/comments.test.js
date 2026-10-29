@@ -63,6 +63,11 @@ function harness() {
   const vscode = {
     ConfigurationTarget: { Global: 1 },
     CommentMode: { Preview: 0 },
+    EventEmitter: class {
+      constructor() { this.listeners = []; this.event = (listener) => { this.listeners.push(listener); return disposable; }; }
+      fire(value) { this.listeners.forEach((listener) => listener(value)); }
+      dispose() {}
+    },
     ViewColumn: { Active: 1 },
     MarkdownString: class { constructor(value) { this.value = value; } },
     Range: class { constructor(line) { this.start = { line }; } },
@@ -149,13 +154,13 @@ function harness() {
       assert.deepEqual(errors, []);
       assert.equal(threads.length, 3);
     },
-    async openWebview() {
+    async openWebview(aiReview) {
       const { PullRequestWebview } = load(path.join(root, "views/pullRequestWebview.js"), overrides);
       return PullRequestWebview.open({
         id: 42, title: "Test", state: "OPEN",
-        source: { branch: { name: "feature" } }, destination: { branch: { name: "main" } },
+        source: { branch: { name: "feature" }, commit: { hash: "abc123" } }, destination: { branch: { name: "main" } },
       }, repository, api, (error) => errors.push(error), () => {}, () => undefined,
-      async () => false, { getProviderLabel: () => "Test" });
+      async () => false, { getProviderLabel: () => "Test" }, aiReview);
     },
   };
 }
@@ -404,6 +409,69 @@ test("webview exposes deletion, validates messages, and updates without reloadin
   assert.equal(view.comments.find((comment) => comment.id === 11).content.raw, "A reply");
   await view.handleMessage({ command: "deleteComment", commentId: 10 });
   assert.equal(h.deletions.length, 1);
+});
+
+test("webview renders the AI review section and validates AI review messages", async () => {
+  const h = harness();
+  const calls = [];
+  const finding = (id, severity, title, extra = {}) => ({
+    id, file: "src/app.js", line: 3, severity, category: "bug", title, body: "Fix <b>this</b>", confidence: 0.9, status: "open", ...extra,
+  });
+  const state = {
+    running: false,
+    result: {
+      verdict: "request_changes",
+      summary: "Adds a feature with one bug.",
+      findings: [
+        finding("b1-1", "major", "Null dereference <script>"),
+        finding("b1-2", "nit", "Dismissed one", { status: "dismissed" }),
+        finding("b1-3", "minor", "Already posted", { status: "posted" }),
+      ],
+      filesReviewed: ["src/app.js"],
+      filesSkipped: ["package-lock.json"],
+      rules: [{ source: "global/general.md", description: "General", applyTo: [] }],
+      sourceCommit: "old",
+      provider: "Fake model",
+      createdAt: "2024-01-01T00:00:00.000Z",
+    },
+  };
+  const host = {
+    getState: () => state,
+    onDidChange: () => ({ dispose() {} }),
+    run: async () => { calls.push(["run"]); },
+    cancel: () => calls.push(["cancel"]),
+    clear: async () => calls.push(["clear"]),
+    editRules: async () => calls.push(["editRules"]),
+    openFinding: async (id) => calls.push(["open", id]),
+    setFindingStatus: async (ids, status) => calls.push(["status", ids, status]),
+    postFindings: async (ids) => { calls.push(["post", ids]); return ids.length; },
+    postSummary: async () => calls.push(["summary"]),
+  };
+  const view = await h.openWebview(host);
+  const html = h.panel.webview.html;
+  assert.match(html, /id="ai-review"/);
+  assert.match(html, /Changes needed/);
+  assert.match(html, /Null dereference &lt;script&gt;/);
+  assert.doesNotMatch(html, /Null dereference <script>/);
+  assert.match(html, /global\/general\.md/);
+  assert.match(html, /package-lock\.json/);
+  assert.match(html, /new commits/i);
+  const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
+  assert.doesNotThrow(() => new vm.Script(script));
+
+  await view.handleMessage({ command: "aiReview", action: "run" });
+  await view.handleMessage({ command: "aiReview", action: "editRules" });
+  await view.handleMessage({ command: "aiReview", action: "unknown" });
+  await view.handleMessage({ command: "aiReviewFindings", action: "dismiss", ids: ["b1-1"] });
+  await view.handleMessage({ command: "aiReviewFindings", action: "post", ids: ["b1-1", "b1-3"] });
+  await view.handleMessage({ command: "aiReviewFindings", action: "open", ids: ["b1-1"] });
+  await view.handleMessage({ command: "aiReviewFindings", action: "post", ids: ["../bad id"] });
+  await view.handleMessage({ command: "aiReviewFindings", action: "post", ids: "b1-1" });
+  assert.deepEqual(calls.slice(0, 2), [["run"], ["editRules"]]);
+  assert.ok(calls.some((call) => call[0] === "status" && call[1][0] === "b1-1" && call[2] === "dismissed"));
+  assert.ok(calls.some((call) => call[0] === "post" && call[1].includes("b1-1")));
+  assert.ok(calls.some((call) => call[0] === "open" && call[1] === "b1-1"));
+  assert.equal(calls.filter((call) => call[0] === "post").length, 1);
 });
 
 test("webview cancellation and permission errors retain the published comment", async () => {

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { buildImprovePrompt, cleanSuggestion, ImprovePrompt, ImproveRequest } from "./prompt";
 import {
+  CompletionOptions,
   DEFAULT_GEMINI_MODEL,
   DEFAULT_OPENAI_MODEL,
   requestGemini,
@@ -20,6 +21,9 @@ const PROVIDERS: { id: AiProvider; label: string; detail: string }[] = [
   { id: "gemini", label: "Google Gemini", detail: "Uses a Google AI Studio (Gemini) API key." },
 ];
 const PREFERRED_COPILOT_FAMILIES = ["gpt-4.1", "gpt-4o", "gpt-5-mini", "claude-sonnet-4", "gpt-4o-mini"];
+const DEFAULT_INPUT_CHAR_BUDGET = 120_000;
+const MAX_INPUT_CHAR_BUDGET = 400_000;
+const MIN_INPUT_CHAR_BUDGET = 12_000;
 
 export class CommentImprover {
   constructor(private readonly secrets: vscode.SecretStorage) {}
@@ -34,13 +38,30 @@ export class CommentImprover {
   }
 
   async improve(request: ImproveRequest, token: vscode.CancellationToken): Promise<string> {
-    const prompt = buildImprovePrompt(request);
+    const raw = await this.complete(
+      buildImprovePrompt(request),
+      { justification: "DiffSpark uses Copilot to improve the pull request comment you are writing." },
+      token,
+    );
+    const suggestion = cleanSuggestion(raw);
+    if (!suggestion) {
+      throw new Error("The AI returned an empty suggestion. Try again.");
+    }
+    return suggestion;
+  }
+
+  /** Sends a prompt to the configured provider and returns the raw answer. */
+  async complete(
+    prompt: ImprovePrompt,
+    options: CompletionOptions & { justification?: string },
+    token: vscode.CancellationToken,
+  ): Promise<string> {
     const provider = this.getProvider();
     const configuration = vscode.workspace.getConfiguration(CONFIG_SECTION);
     const model = configuration.get<string>("model")?.trim() || undefined;
     let raw: string;
     if (provider === "copilot") {
-      raw = await this.requestCopilot(prompt, model, token);
+      raw = await this.requestCopilot(prompt, model, options.justification, token);
     } else {
       const apiKey = await this.getOrPromptApiKey(provider);
       const controller = new AbortController();
@@ -52,8 +73,16 @@ export class CommentImprover {
               model,
               baseUrl: configuration.get<string>("openaiBaseUrl"),
               signal: controller.signal,
+              json: options.json,
+              temperature: options.temperature,
             })
-          : await requestGemini(prompt, { apiKey, model, signal: controller.signal });
+          : await requestGemini(prompt, {
+              apiKey,
+              model,
+              signal: controller.signal,
+              json: options.json,
+              temperature: options.temperature,
+            });
       } catch (error) {
         if (token.isCancellationRequested) {
           throw new vscode.CancellationError();
@@ -66,11 +95,30 @@ export class CommentImprover {
     if (token.isCancellationRequested) {
       throw new vscode.CancellationError();
     }
-    const suggestion = cleanSuggestion(raw);
-    if (!suggestion) {
-      throw new Error("The AI returned an empty suggestion. Try again.");
+    return raw;
+  }
+
+  /** Approximate number of prompt characters the selected model can take comfortably. */
+  async getInputCharBudget(): Promise<number> {
+    if (this.getProvider() !== "copilot") {
+      return DEFAULT_INPUT_CHAR_BUDGET;
     }
-    return suggestion;
+    try {
+      const model = await this.selectCopilotModel(vscode.workspace.getConfiguration(CONFIG_SECTION).get<string>("model")?.trim() || undefined);
+      const tokens = model?.maxInputTokens;
+      if (typeof tokens === "number" && tokens > 0) {
+        return Math.max(MIN_INPUT_CHAR_BUDGET, Math.min(MAX_INPUT_CHAR_BUDGET, Math.floor(tokens * 3 * 0.6)));
+      }
+    } catch {
+      // Fall back to the default budget.
+    }
+    return DEFAULT_INPUT_CHAR_BUDGET;
+  }
+
+  /** "Provider (model)" label for display. */
+  getModelLabel(): string {
+    const model = vscode.workspace.getConfiguration(CONFIG_SECTION).get<string>("model")?.trim();
+    return model ? `${this.getProviderLabel()} (${model})` : this.getProviderLabel();
   }
 
   async selectProvider(): Promise<boolean> {
@@ -82,7 +130,7 @@ export class CommentImprover {
         detail: provider.detail,
         id: provider.id,
       })),
-      { title: "DiffSpark: AI provider for \"Improve comment\"", placeHolder: "Select the AI provider" },
+      { title: "DiffSpark: AI provider", placeHolder: "Select the AI provider" },
     );
     if (!picked) {
       return false;
@@ -100,7 +148,7 @@ export class CommentImprover {
       }
     }
     void vscode.window.showInformationMessage(
-      `DiffSpark: "Improve comment" will use ${picked.label}${model ? ` (${model})` : ""}.`,
+      `DiffSpark: AI features will use ${picked.label}${model ? ` (${model})` : ""}.`,
     );
     return true;
   }
@@ -185,27 +233,35 @@ export class CommentImprover {
     return model === undefined ? undefined : model.trim();
   }
 
-  private async requestCopilot(
-    prompt: ImprovePrompt,
-    family: string | undefined,
-    token: vscode.CancellationToken,
-  ): Promise<string> {
+  private async selectCopilotModel(family: string | undefined): Promise<vscode.LanguageModelChat | undefined> {
     if (!vscode.lm?.selectChatModels) {
       throw new Error("This VS Code version does not support the Language Model API. Choose OpenAI or Gemini with \"DiffSpark: Select AI Provider\".");
     }
     const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
     if (models.length === 0) {
+      return undefined;
+    }
+    return (family && (models.find((item) => item.family === family) ?? models.find((item) => item.id === family))) ||
+      PREFERRED_COPILOT_FAMILIES.map((preferred) => models.find((item) => item.family === preferred)).find(Boolean) ||
+      models[0];
+  }
+
+  private async requestCopilot(
+    prompt: ImprovePrompt,
+    family: string | undefined,
+    justification: string | undefined,
+    token: vscode.CancellationToken,
+  ): Promise<string> {
+    const model = await this.selectCopilotModel(family);
+    if (!model) {
       throw new Error(
         "GitHub Copilot is not available. Sign in to GitHub Copilot, or choose OpenAI or Gemini with \"DiffSpark: Select AI Provider\".",
       );
     }
-    const model = (family && (models.find((item) => item.family === family) ?? models.find((item) => item.id === family))) ||
-      PREFERRED_COPILOT_FAMILIES.map((preferred) => models.find((item) => item.family === preferred)).find(Boolean) ||
-      models[0];
     try {
       const response = await model.sendRequest(
         [vscode.LanguageModelChatMessage.User(`${prompt.system}\n\n${prompt.user}`)],
-        { justification: "DiffSpark uses Copilot to improve the pull request comment you are writing." },
+        { justification: justification ?? "DiffSpark uses Copilot to help you review pull requests." },
         token,
       );
       let text = "";

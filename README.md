@@ -28,6 +28,7 @@
 
 - [Why DiffSpark?](#why-diffspark)
 - [✨ AI comment assistant](#ai-comment-assistant)
+- [🤖 Review with AI](#review-with-ai)
 - [🔎 Find the right pull request, fast](#smart-filters)
 - [🗂️ A file layout that fits your flow](#file-layout)
 - [💬 Review, discuss, and merge](#review-and-merge)
@@ -47,6 +48,7 @@
 | | |
 | --- | --- |
 | ✨ **AI comment assistant** | Turn a rushed note into clear, kind, actionable feedback in one click — with GitHub Copilot, OpenAI, or Gemini. |
+| 🤖 **Review with AI** | Let the AI review every change in the PR against **your team's rules** and propose fixes — or tell you it looks good. |
 | 🔎 **Smart filters & sorting** | Filter by status, drafts, and author (with avatars), and sort by **Recently updated** or **Oldest**. |
 | 🗂️ **Your layout, your flow** | Browse changed files as a folder tree or a flat list. |
 | 🧩 **Native diffs** | Side-by-side diffs in VS Code, including added, removed, renamed, and fork files. |
@@ -102,6 +104,62 @@ Choose a provider with **DiffSpark: Select AI Provider**:
 | **GitHub Copilot** (default) | Uses the VS Code Language Model API and your Copilot subscription. No API key — VS Code asks once for permission. |
 | **OpenAI** | Run **DiffSpark: Set AI API Key**. Default model `gpt-4o-mini`. Works with any OpenAI-compatible endpoint via `diffspark.ai.openaiBaseUrl` (HTTPS, or HTTP on localhost). |
 | **Google Gemini** | Run **DiffSpark: Set AI API Key** with a [Google AI Studio](https://aistudio.google.com/apikey) key. Default model `gemini-2.5-flash`. |
+
+<a id="review-with-ai"></a>
+
+## 🤖 Review with AI
+
+> **A first pass on the whole PR, so you can focus on what matters.**
+
+Click the ✦ icon next to a pull request (or run **DiffSpark: Review Pull Request with AI**). DiffSpark sends the changes to your AI provider and shows the result in the **AI Review** section of the pull request view:
+
+- **Verdict**: ✅ *Looks good*, 💬 *Comments*, or ⛔ *Changes needed*, plus a short summary of what the PR does.
+- **Findings** grouped by severity (🔴 blocker, 🟠 major, 🟡 minor, ⚪ nit). Each one has a file and line, an explanation, an optional suggested fix, and a confidence score. Violations of your rules are tagged *Team rule*.
+- **Drafts in the diff**: open a changed file and the findings appear on their lines as *AI review · not posted* drafts.
+
+**Nothing is posted automatically.** For each finding you can click **Post comment** to publish it as a Bitbucket inline comment (it falls back to a general comment when the line is no longer in the diff). You can also click its location to open the diff and edit the draft before posting, or **Dismiss** it. You can also post several at once with **Post selected**, or use **Post summary as comment**. Then **Approve** or **Request changes** in one click.
+
+How it works:
+
+- Changes are reviewed against the merge base, the same diff you see. Lock files, build output, minified files, and binaries are skipped. Add more with `diffspark.ai.review.exclude`.
+- Large PRs are split into parts that fit the model's context window, then consolidated into a single verdict with duplicates removed. Above `diffspark.ai.review.maxFiles` changed files, DiffSpark asks whether to review only the first files.
+- Findings below `diffspark.ai.review.minSeverity` or `diffspark.ai.review.minConfidence` are hidden to reduce noise.
+- The result is cached per PR. When new commits are pushed, a notice offers to run **Review again**. You can **Stop** a running review at any time.
+- The review is written in your VS Code display language, or in the language set in `diffspark.ai.review.language`.
+
+### Teach the reviewer your rules
+
+Review rules are Markdown files that tell the AI what to focus on or consider. Write them the way you would brief a new reviewer on your team. Run **DiffSpark: Edit AI Review Rules** (or click **Edit rules…** in the AI Review section) to create or open them.
+
+```markdown
+---
+applyTo: "**/*.{ts,tsx}"          # optional: only for these files (comma-separated globs)
+description: TypeScript guidelines
+---
+# TypeScript guidelines
+
+- **Important:** never use `any`; prefer `unknown` and narrow it.
+- Prefer early returns over nested `if/else` blocks.
+- Functions with more than two parameters must use an options object.
+
+❌ Avoid
+    function create(name: string, age: number, admin: boolean) {}
+
+✅ Prefer
+    function create({ name, age, admin }: CreateUserOptions) {}
+```
+
+- Without `applyTo` (or with `applyTo: "**"`), a file applies to every change. With it, the file is only sent when the part being reviewed touches matching files.
+- Mark important rules (for example **Important** or *must be blocked*) and the AI treats violations as more severe.
+
+Rules are loaded from:
+
+| Source | Location | Notes |
+| --- | --- | --- |
+| **Your rules** | `review-rules/*.md` in DiffSpark's global storage | Personal and shared by every repository. Managed with **DiffSpark: Edit AI Review Rules**. |
+| **Repository instructions** | `AGENTS.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` in your local checkout | The same files GitHub Copilot uses, so team conventions committed to the repo are applied automatically. Turn this off with `diffspark.ai.review.useRepositoryInstructions`. |
+
+The rules applied in each review are listed in the **AI Review** section. Each file is capped at 20,000 characters, with 40,000 in total.
 
 <a id="smart-filters"></a>
 
@@ -191,6 +249,8 @@ Optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL (`*
 | `DiffSpark: Sort Pull Requests` | Change the sort order. |
 | `DiffSpark: Select File Layout` | Switch between tree and list layouts. |
 | `DiffSpark: Open Pull Request` | Open the pull request view. |
+| `DiffSpark: Review Pull Request with AI` | Review every change in a pull request with AI. |
+| `DiffSpark: Edit AI Review Rules` | Create or open the Markdown rules that guide the AI reviewer. |
 | `DiffSpark: Select AI Provider` | Choose GitHub Copilot, OpenAI, or Gemini. |
 | `DiffSpark: Set AI API Key` | Store the OpenAI or Gemini API key. |
 
@@ -202,12 +262,20 @@ Optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL (`*
 | `diffspark.ai.provider` | `copilot` | AI provider: `copilot`, `openai`, or `gemini`. |
 | `diffspark.ai.model` | `""` | Optional model override (Copilot model family or OpenAI/Gemini model name). |
 | `diffspark.ai.openaiBaseUrl` | `https://api.openai.com/v1` | Base URL for OpenAI-compatible endpoints (Azure OpenAI, OpenRouter, local servers…). |
+| `diffspark.ai.review.language` | `""` | Language of the AI review (for example `Portuguese (Brazil)` or `pt-br`). Empty uses the VS Code display language. |
+| `diffspark.ai.review.minSeverity` | `minor` | Lowest severity shown: `nit`, `minor`, `major`, or `blocker`. |
+| `diffspark.ai.review.minConfidence` | `0.5` | Hide findings the AI is less confident about (0–1). |
+| `diffspark.ai.review.exclude` | `[]` | Extra glob patterns of files to skip (lock files, build output, and binaries are always skipped). |
+| `diffspark.ai.review.focus` | `[]` | Areas to emphasize: `security`, `performance`, `tests`, `readability`, `design`. |
+| `diffspark.ai.review.useRepositoryInstructions` | `true` | Also apply `AGENTS.md`, `.github/copilot-instructions.md`, and `.github/instructions/*.instructions.md` from the checkout. |
+| `diffspark.ai.review.maxFiles` | `60` | Ask before reviewing pull requests with more changed files than this. |
 
 ## Security & privacy
 
 - Bitbucket, Jira, and AI credentials are stored in VS Code **SecretStorage** — never in settings or workspace files.
 - Bitbucket redirects are followed only within `https://api.bitbucket.org/2.0/` (up to 5), so Bitbucket credentials never reach another host. Write requests are repeated only on method-preserving redirects (307/308).
 - **AI context:** your draft comment is always sent to the selected provider. Inline comments also include the file path, about 17 lines around the commented line, and earlier messages in the thread; the PR view includes the PR title, description, and the parent discussion for replies.
+- **Review with AI** sends the PR title, branches, and description, the diffs of the reviewed files (excluded and binary files are never sent), and the applicable review rules. The PR description and code are treated as untrusted data in the prompt, so instructions hidden in them are not followed. Findings stay local, in the workspace state, until you post them.
 
 ## Limitations
 
@@ -227,6 +295,8 @@ Errors are logged in **Output → DiffSpark**.
 | No trash icon on your existing comments, or review buttons ignore your approval | Token is missing `read:user:bitbucket`. |
 | *GitHub Copilot is not available* | Sign in to GitHub Copilot, or switch provider with **DiffSpark: Select AI Provider**. |
 | Improve comment fails with HTTP 401/403 | Wrong OpenAI/Gemini key — run **DiffSpark: Set AI API Key**. |
+| AI review lists *Files not reviewed* | A part of the PR failed or was too large; the details are in **Output → DiffSpark**. Re-run the review, or exclude generated files with `diffspark.ai.review.exclude`. |
+| My review rules are ignored | Check the `applyTo` globs: rules are sent only when the reviewed files match them. The rules actually applied are listed in the AI Review section. |
 
 ## Development
 

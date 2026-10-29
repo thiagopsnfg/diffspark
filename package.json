@@ -164,6 +164,16 @@
         "title": "DiffSpark: Set AI API Key",
         "command": "bitbucketPrReviewer.setAiApiKey",
         "icon": "$(key)"
+      },
+      {
+        "title": "DiffSpark: Review Pull Request with AI",
+        "command": "bitbucketPrReviewer.reviewWithAi",
+        "icon": "$(sparkle)"
+      },
+      {
+        "title": "DiffSpark: Edit AI Review Rules",
+        "command": "bitbucketPrReviewer.editReviewRules",
+        "icon": "$(book)"
       }
     ],
     "configuration": {
@@ -171,7 +181,10 @@
       "properties": {
         "diffspark.files.layout": {
           "type": "string",
-          "enum": ["tree", "list"],
+          "enum": [
+            "tree",
+            "list"
+          ],
           "enumDescriptions": [
             "Nest changed files in their repository folders.",
             "Show changed files in a flat list with their folder paths as text."
@@ -192,33 +205,130 @@
             "Google Gemini using an API key."
           ],
           "default": "copilot",
-          "markdownDescription": "AI provider used by **Improve comment**. API keys are set with the `DiffSpark: Set AI API Key` command and stored in VS Code's secret storage."
+          "markdownDescription": "AI provider used by **Improve comment** and **Review with AI**. API keys are set with the `DiffSpark: Set AI API Key` command and stored in VS Code's secret storage."
         },
         "diffspark.ai.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Optional model for **Improve comment**. Copilot: a model family such as `gpt-4.1`. OpenAI default: `gpt-4o-mini`. Gemini default: `gemini-2.5-flash`."
+          "markdownDescription": "Optional model for **Improve comment** and **Review with AI**. Copilot: a model family such as `gpt-4.1`. OpenAI default: `gpt-4o-mini`. Gemini default: `gemini-2.5-flash`."
         },
         "diffspark.ai.openaiBaseUrl": {
           "type": "string",
           "default": "https://api.openai.com/v1",
           "markdownDescription": "Base URL for the OpenAI provider. Change it to use an OpenAI-compatible endpoint (for example Azure OpenAI, OpenRouter or a local server)."
+        },
+        "diffspark.ai.review.language": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Language of the **Review with AI** summary and comments, e.g. `Portuguese (Brazil)` or `English`. Leave empty to use the VS Code display language."
+        },
+        "diffspark.ai.review.minSeverity": {
+          "type": "string",
+          "enum": [
+            "nit",
+            "minor",
+            "major",
+            "blocker"
+          ],
+          "enumDescriptions": [
+            "Show everything, including small optional improvements.",
+            "Hide nitpicks.",
+            "Only likely bugs, wrong behaviour and important rule violations.",
+            "Only problems that must block the merge."
+          ],
+          "default": "minor",
+          "markdownDescription": "Lowest severity of the **Review with AI** findings to show."
+        },
+        "diffspark.ai.review.minConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5,
+          "markdownDescription": "Hide **Review with AI** findings the AI is less confident about (0–1)."
+        },
+        "diffspark.ai.review.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra glob patterns of files that **Review with AI** must skip, e.g. `**/generated/**`. Lockfiles, `dist/`, minified files, source maps, snapshots and binaries are always skipped."
+        },
+        "diffspark.ai.review.focus": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "security",
+              "performance",
+              "tests",
+              "readability",
+              "design"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "Areas **Review with AI** should pay extra attention to. Bugs are always checked."
+        },
+        "diffspark.ai.review.useRepositoryInstructions": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Use the repository instructions found in the local clone (`AGENTS.md`, `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` with `applyTo`) as review rules, together with your global rules (`DiffSpark: Edit AI Review Rules`)."
+        },
+        "diffspark.ai.review.maxFiles": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60,
+          "markdownDescription": "Ask for confirmation before reviewing pull requests with more reviewable files than this."
         }
       }
     },
     "menus": {
       "commandPalette": [
-        { "command": "bitbucketPrReviewer.deleteDiffComment", "when": "false" },
-        { "command": "bitbucketPrReviewer.improveDiffComment", "when": "false" },
-        { "command": "bitbucketPrReviewer.improveDiffCommentWith", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiSuggestionReplace", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiSuggestionInsert", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiSuggestionRetry", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiSuggestionDiscard", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiDraftPost", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiDraftImprove", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiDraftImproveWith", "when": "false" },
-        { "command": "bitbucketPrReviewer.aiDraftDelete", "when": "false" }
+        {
+          "command": "bitbucketPrReviewer.deleteDiffComment",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.improveDiffComment",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.improveDiffCommentWith",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionReplace",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionInsert",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionRetry",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiSuggestionDiscard",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftPost",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftImprove",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftImproveWith",
+          "when": "false"
+        },
+        {
+          "command": "bitbucketPrReviewer.aiDraftDelete",
+          "when": "false"
+        }
       ],
       "comments/commentThread/context": [
         {
@@ -334,6 +444,23 @@
           "command": "bitbucketPrReviewer.selectRepository",
           "when": "view == bitbucketPrReviewer.pullRequests"
         }
+      ],
+      "view/item/context": [
+        {
+          "command": "bitbucketPrReviewer.reviewWithAi",
+          "when": "view == bitbucketPrReviewer.pullRequests && viewItem == bitbucketPullRequest",
+          "group": "inline"
+        },
+        {
+          "command": "bitbucketPrReviewer.reviewWithAi",
+          "when": "view == bitbucketPrReviewer.pullRequests && viewItem == bitbucketPullRequest",
+          "group": "ai@1"
+        },
+        {
+          "command": "bitbucketPrReviewer.editReviewRules",
+          "when": "view == bitbucketPrReviewer.pullRequests && viewItem == bitbucketPullRequest",
+          "group": "ai@2"
+        }
       ]
     }
   },
@@ -345,7 +472,9 @@
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
+    "diff": "^8.0.4",
     "markdown-it": "^14.1.0",
+    "minimatch": "^10.2.6",
     "sanitize-html": "^2.14.0"
   },
   "devDependencies": {

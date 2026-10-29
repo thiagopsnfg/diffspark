@@ -56,6 +56,13 @@ function httpsTransport(
   });
 }
 
+export interface ComparisonContext {
+  sourceHash: string;
+  destinationHash: string;
+  sourceRepository: BitbucketRepository;
+  getMergeBase(): Promise<string>;
+}
+
 export class BitbucketApiError extends Error {
   constructor(readonly statusCode: number, message: string) {
     super(message);
@@ -118,11 +125,8 @@ export class BitbucketClient {
     });
   }
 
-  async getFileComparison(
-    repository: BitbucketRepository,
-    pullRequestId: number,
-    file: ChangedFile,
-  ): Promise<{ before: string; after: string }> {
+  /** Resolves the PR commits once so many files can be compared without re-fetching the PR and merge base. */
+  async getComparisonContext(repository: BitbucketRepository, pullRequestId: number): Promise<ComparisonContext> {
     const pullRequest = await this.request<PullRequest>(
       new URL(this.pullRequestPath(repository, pullRequestId, ""), API_ORIGIN).toString(),
       { method: "GET" },
@@ -134,14 +138,33 @@ export class BitbucketClient {
     }
     const sourceFullName = pullRequest.source.repository?.full_name ?? repository.fullName;
     const [workspace, slug] = sourceFullName.split("/");
-    const sourceRepository = { workspace, slug, fullName: sourceFullName };
-    const base = file.status === "added" ? undefined : await this.request<{ hash: string }>(
-      new URL(this.repositoryPath(repository, `/merge-base/${encodeURIComponent(destinationHash)}..${encodeURIComponent(sourceHash)}`), API_ORIGIN).toString(),
-      { method: "GET" },
-    );
+    let mergeBase: Promise<string> | undefined;
+    return {
+      sourceHash,
+      destinationHash,
+      sourceRepository: { workspace, slug, fullName: sourceFullName },
+      getMergeBase: () => {
+        mergeBase ??= this.request<{ hash: string }>(
+          new URL(this.repositoryPath(repository, `/merge-base/${encodeURIComponent(destinationHash)}..${encodeURIComponent(sourceHash)}`), API_ORIGIN).toString(),
+          { method: "GET" },
+        ).then((base) => base.hash);
+        mergeBase.catch(() => { mergeBase = undefined; });
+        return mergeBase;
+      },
+    };
+  }
+
+  async getFileComparison(
+    repository: BitbucketRepository,
+    pullRequestId: number,
+    file: ChangedFile,
+    context?: ComparisonContext,
+  ): Promise<{ before: string; after: string }> {
+    const comparison = context ?? await this.getComparisonContext(repository, pullRequestId);
+    const base = file.status === "added" ? undefined : await comparison.getMergeBase();
     const [before, after] = await Promise.all([
-      base ? this.getFileContent(repository, base.hash, file.oldPath ?? file.path) : "",
-      file.status === "removed" ? "" : this.getFileContent(sourceRepository, sourceHash, file.newPath ?? file.path),
+      base ? this.getFileContent(repository, base, file.oldPath ?? file.path) : "",
+      file.status === "removed" ? "" : this.getFileContent(comparison.sourceRepository, comparison.sourceHash, file.newPath ?? file.path),
     ]);
     return { before, after };
   }

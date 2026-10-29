@@ -15,7 +15,13 @@ export const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 export const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 export const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-const TEMPERATURE = 0.3;
+const DEFAULT_TEMPERATURE = 0.3;
+
+export interface CompletionOptions {
+  /** Ask the provider for a JSON object response. */
+  json?: boolean;
+  temperature?: number;
+}
 
 const defaultFetch: FetchLike = (url, init) =>
   (globalThis as unknown as { fetch: FetchLike }).fetch(url, init);
@@ -55,10 +61,11 @@ function normalizeBaseUrl(baseUrl: string | undefined): string {
 
 export async function requestOpenAi(
   prompt: ImprovePrompt,
-  options: { apiKey: string; model?: string; baseUrl?: string; signal?: AbortSignal; fetch?: FetchLike },
+  options: { apiKey: string; model?: string; baseUrl?: string; signal?: AbortSignal; fetch?: FetchLike } & CompletionOptions,
 ): Promise<string> {
   const fetchImpl = options.fetch ?? defaultFetch;
-  const response = await fetchImpl(`${normalizeBaseUrl(options.baseUrl)}/chat/completions`, {
+  const url = `${normalizeBaseUrl(options.baseUrl)}/chat/completions`;
+  const send = (json: boolean) => fetchImpl(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -66,15 +73,22 @@ export async function requestOpenAi(
     },
     body: JSON.stringify({
       model: options.model?.trim() || DEFAULT_OPENAI_MODEL,
-      temperature: TEMPERATURE,
+      temperature: options.temperature ?? DEFAULT_TEMPERATURE,
       messages: [
         { role: "system", content: prompt.system },
         { role: "user", content: prompt.user },
       ],
+      ...(json ? { response_format: { type: "json_object" } } : {}),
     }),
     signal: options.signal,
   });
-  const text = await response.text();
+  let response = await send(Boolean(options.json));
+  let text = await response.text();
+  // Some OpenAI-compatible endpoints reject response_format; the prompt already asks for JSON, so retry without it.
+  if (options.json && response.status === 400 && /response_format|json/i.test(text)) {
+    response = await send(false);
+    text = await response.text();
+  }
   if (!response.ok) {
     throw new Error(apiErrorMessage("OpenAI", response.status, text));
   }
@@ -88,7 +102,7 @@ export async function requestOpenAi(
 
 export async function requestGemini(
   prompt: ImprovePrompt,
-  options: { apiKey: string; model?: string; signal?: AbortSignal; fetch?: FetchLike },
+  options: { apiKey: string; model?: string; signal?: AbortSignal; fetch?: FetchLike } & CompletionOptions,
 ): Promise<string> {
   const fetchImpl = options.fetch ?? defaultFetch;
   const model = options.model?.trim() || DEFAULT_GEMINI_MODEL;
@@ -101,7 +115,10 @@ export async function requestGemini(
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: prompt.system }] },
       contents: [{ role: "user", parts: [{ text: prompt.user }] }],
-      generationConfig: { temperature: TEMPERATURE },
+      generationConfig: {
+        temperature: options.temperature ?? DEFAULT_TEMPERATURE,
+        ...(options.json ? { responseMimeType: "application/json" } : {}),
+      },
     }),
     signal: options.signal,
   });

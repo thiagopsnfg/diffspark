@@ -1,9 +1,16 @@
 import * as vscode from "vscode";
-import { BitbucketClient } from "./bitbucket/client";
 import { JiraClient } from "./jira/client";
-import { parseBitbucketRemoteUrl } from "./bitbucket/repository";
+import { CommentImprover } from "./ai/service";
+import { AiReviewFinding } from "./ai/review/types";
+import { BitbucketClient } from "./bitbucket/client";
+import { pickImproveOptions } from "./ai/actionPicker";
+import { AiReviewHost } from "./views/pullRequestWebview";
+import { AiReviewer, aiReviewKey } from "./ai/review/runner";
 import { PullRequestWebview } from "./views/pullRequestWebview";
+import { parseBitbucketRemoteUrl } from "./bitbucket/repository";
+import { buildCodeSnippet, describeImproveOptions, ImproveOptions } from "./ai/prompt";
 import { FileLayout, PullRequestAuthor, PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
+import { categoryLabel, formatFindingComment, formatSummaryComment, SEVERITY_LABELS } from "./ai/review/parse";
 import {
   PullRequest,
   PullRequestState,
@@ -11,9 +18,6 @@ import {
   ChangedFile,
   PullRequestComment,
 } from "./bitbucket/types";
-import { CommentImprover } from "./ai/service";
-import { pickImproveOptions } from "./ai/actionPicker";
-import { buildCodeSnippet, describeImproveOptions, ImproveOptions } from "./ai/prompt";
 
 const EMAIL_SECRET = "bitbucket-pr-reviewer.email";
 const TOKEN_SECRET = "bitbucket-pr-reviewer.api-token";
@@ -74,12 +78,20 @@ interface DiffComment extends vscode.Comment {
 
 type AiCommentKind = "loading" | "suggestion" | "draft";
 
+interface AiFindingRef {
+  key: string;
+  id: string;
+  line?: number;
+}
+
 interface AiComment extends vscode.Comment {
   ai: {
     kind: AiCommentKind;
     thread: vscode.CommentThread;
     original: string;
     options: ImproveOptions;
+    /** Set when the draft was created by "Review with AI". */
+    finding?: AiFindingRef;
   };
 }
 
@@ -99,6 +111,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const output = vscode.window.createOutputChannel("DiffSpark");
   context.subscriptions.push(output);
   const improver = new CommentImprover(context.secrets);
+  const aiReviewer = new AiReviewer(
+    context,
+    improver,
+    () => getClient(),
+    (message) => output.appendLine(`[${new Date().toISOString()}] ${message}`),
+  );
+  context.subscriptions.push(aiReviewer);
 
   let client: BitbucketClient | undefined;
   let jiraClient: JiraClient | undefined;
@@ -445,6 +464,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const diffContents = new Map<string, string>();
   const diffMetadata = new Map<string, DiffMetadata>();
+  const diffUris = new Map<string, vscode.Uri>();
   let diffSequence = 0;
   let identityWarningShown = false;
   const commentController = vscode.comments.createCommentController("diffspark", "DiffSpark");
@@ -476,6 +496,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       dispose: () => {
         diffContents.clear();
         diffMetadata.clear();
+        diffUris.clear();
       },
     },
   );
@@ -595,7 +616,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  const postDiffComment = async (thread: vscode.CommentThread, text: string): Promise<boolean> => {
+  const postDiffComment = async (
+    thread: vscode.CommentThread,
+    text: string,
+    options: { fileLevel?: boolean } = {},
+  ): Promise<boolean> => {
     if (!text.trim()) {
       return false;
     }
@@ -617,7 +642,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       parentId === undefined
         ? {
             path: metadata.path,
-            ...(metadata.side === "after" ? { to: line! + 1 } : { from: line! + 1 }),
+            ...(options.fileLevel ? {} : metadata.side === "after" ? { to: line! + 1 } : { from: line! + 1 }),
           }
         : undefined,
     );
@@ -636,6 +661,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     original: string,
     options: ImproveOptions,
   ): void => {
+    const finding = thread.comments.find(isAiComment)?.ai.finding;
     const loadingBody = new vscode.MarkdownString(
       `$(loading~spin) **${describeImproveOptions(options)}** with ${improver.getProviderLabel()}…`,
       true,
@@ -649,13 +675,116 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       label: kind === "suggestion" ? `AI suggestion · ${describeImproveOptions(options)}` : undefined,
       contextValue: AI_CONTEXT_VALUES[kind],
-      ai: { kind, thread, original, options },
+      ai: { kind, thread, original, options, ...(finding ? { finding } : {}) },
     };
     thread.comments = [...thread.comments.filter((item) => !isAiComment(item)), comment];
   };
 
   const removeAiComments = (thread: vscode.CommentThread): void => {
     thread.comments = thread.comments.filter((item) => !isAiComment(item));
+  };
+
+  /** Inline threads created from AI review findings, keyed by `${diff uri}|${finding id}`. */
+  const findingThreads = new Map<string, { key: string; id: string; createdAt: string; thread: vscode.CommentThread }>();
+
+  const untrackFindingThread = (thread: vscode.CommentThread): void => {
+    for (const [threadKey, entry] of findingThreads) {
+      if (entry.thread === thread) {
+        findingThreads.delete(threadKey);
+      }
+    }
+  };
+
+  const createFindingComment = (thread: vscode.CommentThread, finding: AiReviewFinding, key: string): AiComment => ({
+    body: new vscode.MarkdownString(formatFindingComment(finding)),
+    mode: vscode.CommentMode.Preview,
+    author: { name: "AI review · not posted", iconPath: aiAuthorIcon },
+    label: `${SEVERITY_LABELS[finding.severity]} · ${categoryLabel(finding)}`,
+    contextValue: AI_CONTEXT_VALUES.draft,
+    ai: {
+      kind: "draft",
+      thread,
+      original: formatFindingComment(finding),
+      options: { action: "improve" },
+      finding: { key, id: finding.id, ...(finding.line === undefined ? {} : { line: finding.line }) },
+    },
+  });
+
+  const addFindingThreads = (uriString: string): void => {
+    const metadata = diffMetadata.get(uriString);
+    const uri = diffUris.get(uriString);
+    if (!metadata || !uri) {
+      return;
+    }
+    const targetSide = metadata.file.status === "removed" ? "before" : "after";
+    if (metadata.side !== targetSide) {
+      return;
+    }
+    const key = aiReviewKey(metadata.bitbucketRepository, metadata.pullRequestId);
+    const result = aiReviewer.getResult(key);
+    const filePath = metadata.file.newPath ?? metadata.file.path;
+    for (const finding of result?.findings ?? []) {
+      const threadKey = `${uriString}|${finding.id}`;
+      if (finding.status !== "open" || finding.file !== filePath || findingThreads.has(threadKey)) {
+        continue;
+      }
+      const line = finding.line !== undefined && metadata.side === "after" ? finding.line - 1 : 0;
+      const thread = commentController.createCommentThread(uri, new vscode.Range(line, 0, line, 0), []);
+      if (vscode.CommentThreadCollapsibleState) {
+        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      }
+      thread.comments = [createFindingComment(thread, finding, key)];
+      findingThreads.set(threadKey, { key, id: finding.id, createdAt: result!.createdAt, thread });
+    }
+  };
+
+  const syncFindingThreads = (key: string): void => {
+    const result = aiReviewer.getResult(key);
+    const openIds = new Set(result?.findings.filter((finding) => finding.status === "open").map((finding) => finding.id));
+    for (const [threadKey, entry] of findingThreads) {
+      if (entry.key === key && (!result || result.createdAt !== entry.createdAt || !openIds.has(entry.id))) {
+        entry.thread.dispose();
+        findingThreads.delete(threadKey);
+      }
+    }
+    if (!result) {
+      return;
+    }
+    const openDocuments = new Set((vscode.workspace.textDocuments ?? []).map((document) => document.uri.toString()));
+    for (const [uriString, metadata] of diffMetadata) {
+      if (openDocuments.has(uriString) && aiReviewKey(metadata.bitbucketRepository, metadata.pullRequestId) === key) {
+        addFindingThreads(uriString);
+      }
+    }
+  };
+
+  context.subscriptions.push(
+    aiReviewer.onDidChange((key) => syncFindingThreads(key)),
+    ...(vscode.workspace.onDidCloseTextDocument
+      ? [vscode.workspace.onDidCloseTextDocument((document) => {
+          const uriString = document.uri.toString();
+          for (const [threadKey, entry] of findingThreads) {
+            if (threadKey.startsWith(`${uriString}|`)) {
+              entry.thread.dispose();
+              findingThreads.delete(threadKey);
+            }
+          }
+        })]
+      : []),
+  );
+
+  /** Posts an AI draft (or AI suggestion) and, when it came from an AI review finding, marks the finding as posted. */
+  const postAiComment = async (comment: AiComment, text: string): Promise<boolean> => {
+    const finding = comment.ai.finding;
+    if (!(await postDiffComment(comment.ai.thread, text, { fileLevel: Boolean(finding && finding.line === undefined) }))) {
+      return false;
+    }
+    untrackFindingThread(comment.ai.thread);
+    removeAiComments(comment.ai.thread);
+    if (finding) {
+      await aiReviewer.updateFindingStatus(finding.key, [finding.id], "posted");
+    }
+    return true;
   };
 
   const improveInThread = async (
@@ -729,6 +858,121 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await improveInThread(comment.ai.thread, text, options, { kind: "draft", text, original: text, options });
   };
 
+  const pickLoadedPullRequest = async (): Promise<PullRequest | undefined> => {
+    const pullRequests = provider.getLoadedPullRequests?.() ?? [];
+    if (pullRequests.length === 0) {
+      void vscode.window.showInformationMessage("DiffSpark: Load the pull requests first, then choose one to review with AI.");
+      return undefined;
+    }
+    const picked = await vscode.window.showQuickPick(
+      pullRequests.map((pullRequest) => ({
+        label: pullRequest.title,
+        description: `#${pullRequest.id}`,
+        detail: `${pullRequest.author?.display_name ?? "Unknown author"} · ${pullRequest.source.branch.name} → ${pullRequest.destination.branch.name}`,
+        pullRequest,
+      })),
+      { placeHolder: "Select the pull request to review with AI", matchOnDescription: true },
+    );
+    return picked?.pullRequest;
+  };
+
+  const createAiReviewHost = (pullRequest: PullRequest, repository: BitbucketRepository): AiReviewHost => {
+    const key = aiReviewKey(repository, pullRequest.id);
+    const findFindings = (ids: readonly string[]): AiReviewFinding[] => {
+      const wanted = new Set(ids);
+      return aiReviewer.getResult(key)?.findings.filter((finding) => wanted.has(finding.id)) ?? [];
+    };
+    return {
+      getState: () => aiReviewer.getState(key),
+      onDidChange: (listener) => aiReviewer.onDidChange((changed) => {
+        if (changed === key) {
+          listener();
+        }
+      }),
+      run: async () => {
+        const result = await aiReviewer.review({
+          repository,
+          pullRequest,
+          rootUri: selectedRepository?.bitbucket.fullName === repository.fullName ? selectedRepository.handle.rootUri : undefined,
+        });
+        if (result) {
+          const open = result.findings.length;
+          void vscode.window.showInformationMessage(
+            open === 0
+              ? `DiffSpark: AI review of PR #${pullRequest.id} found nothing relevant to fix.`
+              : `DiffSpark: AI review of PR #${pullRequest.id} found ${open} ${open === 1 ? "point" : "points"} to check. Nothing was posted yet.`,
+          );
+        }
+      },
+      cancel: () => aiReviewer.cancel(key),
+      clear: () => aiReviewer.clear(key),
+      editRules: () => aiReviewer.editRules(selectedRepository?.handle.rootUri),
+      setFindingStatus: (ids, status) => aiReviewer.updateFindingStatus(key, ids, status),
+      openFinding: async (id) => {
+        const finding = findFindings([id])[0];
+        if (!finding) {
+          throw new Error("This AI review finding is no longer available.");
+        }
+        const files = await getClient().getChangedFiles(repository, pullRequest.id);
+        const file = files.find((item) => (item.newPath ?? item.path) === finding.file || item.path === finding.file);
+        if (!file) {
+          throw new Error(`${finding.file} is no longer part of this pull request.`);
+        }
+        await vscode.commands.executeCommand(
+          "bitbucketPrReviewer.openChangedFile",
+          repository,
+          pullRequest.id,
+          file,
+          pullRequest.source.branch.name,
+          pullRequest.source.repository?.full_name,
+          finding.line,
+        );
+      },
+      postFindings: async (ids) => {
+        const findings = findFindings(ids).filter((finding) => finding.status !== "posted");
+        const posted: string[] = [];
+        try {
+          for (const finding of findings) {
+            const inline = finding.line === undefined ? { path: finding.file } : { path: finding.file, to: finding.line };
+            try {
+              await getClient().createComment(repository, pullRequest.id, formatFindingComment(finding), undefined, inline);
+            } catch (error) {
+              output.appendLine(`[${new Date().toISOString()}] Inline AI review comment failed, posting it as a general comment: ${error instanceof Error ? error.message : String(error)}`);
+              await getClient().createComment(repository, pullRequest.id, formatFindingComment(finding, { includeLocation: true }));
+            }
+            posted.push(finding.id);
+          }
+        } finally {
+          await aiReviewer.updateFindingStatus(key, posted, "posted");
+        }
+        if (posted.length > 0) {
+          void vscode.window.showInformationMessage(`DiffSpark: Posted ${posted.length} AI review ${posted.length === 1 ? "comment" : "comments"}.`);
+        }
+        return posted.length;
+      },
+      postSummary: async () => {
+        const result = aiReviewer.getResult(key);
+        if (!result) {
+          throw new Error("Run the AI review first.");
+        }
+        await getClient().createComment(repository, pullRequest.id, formatSummaryComment(result));
+      },
+    };
+  };
+
+  const openPullRequestView = (pullRequest: PullRequest): Promise<PullRequestWebview> =>
+    PullRequestWebview.open(
+      pullRequest,
+      selectedRepository!.bitbucket,
+      getClient(),
+      reportError,
+      () => provider.refresh(),
+      getJiraClient,
+      ensureJiraClient,
+      improver,
+      createAiReviewHost(pullRequest, selectedRepository!.bitbucket),
+    );
+
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.deleteDiffComment",
@@ -780,9 +1024,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       (comment: AiComment) => runAction(async () => {
         const text = commentText(comment);
         try {
-          if (await postDiffComment(comment.ai.thread, text)) {
-            removeAiComments(comment.ai.thread);
-          } else {
+          if (!(await postAiComment(comment, text))) {
             setAiComment(comment.ai.thread, "suggestion", text, comment.ai.original, comment.ai.options);
           }
         } catch (error) {
@@ -820,9 +1062,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       (comment: AiComment) => runAction(async () => {
         const text = commentText(comment);
         try {
-          if (await postDiffComment(comment.ai.thread, text)) {
-            removeAiComments(comment.ai.thread);
-          } else {
+          if (!(await postAiComment(comment, text))) {
             setAiComment(comment.ai.thread, "draft", text, text, comment.ai.options);
           }
         } catch (error) {
@@ -842,7 +1082,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.aiDraftDelete",
       (comment: AiComment) => runAction(async () => {
+        const finding = comment.ai.finding;
         removeAiComments(comment.ai.thread);
+        if (finding) {
+          untrackFindingThread(comment.ai.thread);
+          if (comment.ai.thread.comments.length === 0) {
+            comment.ai.thread.dispose();
+          }
+          await aiReviewer.updateFindingStatus(finding.key, [finding.id], "dismissed");
+        }
       }),
     ),
     vscode.commands.registerCommand("bitbucketPrReviewer.selectAiProvider", () =>
@@ -865,6 +1113,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         file: ChangedFile,
         sourceBranch: string,
         sourceRepositoryFullName?: string,
+        revealLine?: number,
       ) =>
         runAction(async () => {
           if (!repository || !file || !sourceBranch || !(await ensureClient())) {
@@ -895,18 +1144,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             });
             diffContents.set(uri.toString(), content);
             diffMetadata.set(uri.toString(), { ...metadata, side, path });
+            diffUris.set(uri.toString(), uri);
             return uri;
           };
           const left = makeUri("before", file.oldPath ?? file.path, before);
           const right = makeUri("after", file.newPath ?? file.path, after);
+          const selectionLine = typeof revealLine === "number" && revealLine > 0 ? revealLine - 1 : undefined;
           await vscode.commands.executeCommand(
-            "vscode.diff", left, right, `${file.path} (PR #${pullRequestId})`, { preview: true },
+            "vscode.diff",
+            left,
+            right,
+            `${file.path} (PR #${pullRequestId})`,
+            selectionLine === undefined
+              ? { preview: true }
+              : { preview: true, selection: new vscode.Range(selectionLine, 0, selectionLine, 0) },
           );
           try {
             await loadInlineComments(left, right, file, repository, pullRequestId);
           } catch (error) {
             reportError(error);
           }
+          addFindingThreads((file.status === "removed" ? left : right).toString());
         }),
     ),
     vscode.commands.registerCommand(
@@ -1088,17 +1346,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (!pullRequest || !(await ensureClient()) || !(await ensureRepository())) {
             return;
           }
-          await PullRequestWebview.open(
-            pullRequest,
-            selectedRepository!.bitbucket,
-            getClient(),
-            reportError,
-            () => provider.refresh(),
-            getJiraClient,
-            ensureJiraClient,
-            improver,
-          );
+          await openPullRequestView(pullRequest);
         }),
+    ),
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.reviewWithAi",
+      (item?: { pullRequest: PullRequest } | PullRequest) =>
+        runAction(async () => {
+          if (!(await ensureClient()) || !(await ensureRepository())) {
+            return;
+          }
+          const pullRequest = item && "pullRequest" in item
+            ? item.pullRequest
+            : item && "id" in item && "source" in item
+              ? item
+              : await pickLoadedPullRequest();
+          if (!pullRequest) {
+            return;
+          }
+          await openPullRequestView(pullRequest);
+          await createAiReviewHost(pullRequest, selectedRepository!.bitbucket).run();
+        }),
+    ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.editReviewRules", () =>
+      runAction(() => aiReviewer.editRules(selectedRepository?.handle.rootUri)),
     ),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       selectedRepository = undefined;
