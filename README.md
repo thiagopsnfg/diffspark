@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="resources/diffspark-logo.png" alt="DiffSpark" width="420" />
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/thiagopsnfg/diffspark/main/resources/diffspark-logo.png" />
+    <img src="resources/diffspark-logo-dark.png" alt="DiffSpark" width="420" />
+  </picture>
 </p>
 
 <h3 align="center">Smarter reviews. Better code.</h3>
