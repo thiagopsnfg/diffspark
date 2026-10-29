@@ -28,6 +28,31 @@ function fakeTransport(responses) {
   };
 }
 
+test("deletes a published comment using its PR endpoint and accepts an empty 204 response", async () => {
+  const fake = fakeTransport([{ statusCode: 204, body: "" }]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+  assert.equal(await client.deleteComment(repository, 42, 10), undefined);
+  assert.equal(fake.calls[0].method, "DELETE");
+  assert.equal(fake.calls[0].url,
+    "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/comments/10");
+  assert.equal(fake.calls[0].body, undefined);
+});
+
+test("rejects invalid comment IDs without making a request", async () => {
+  const fake = fakeTransport([]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+  for (const id of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "10", "../10"]) {
+    assert.throws(() => client.deleteComment(repository, 42, id), /Invalid pull request comment ID/);
+  }
+  assert.equal(fake.calls.length, 0);
+});
+
+test("reports comment deletion permission errors rather than claiming success", async () => {
+  const fake = fakeTransport([{ statusCode: 403, body: JSON.stringify({ error: { message: "Permission denied." } }) }]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+  await assert.rejects(client.deleteComment(repository, 42, 10), /HTTP 403: Permission denied/);
+});
+
 test("parses HTTPS and SSH Bitbucket remotes", () => {
   assert.deepEqual(
     parseBitbucketRemoteUrl("https://someone@bitbucket.org/iptvplatform/iptv-dashboard.git"),

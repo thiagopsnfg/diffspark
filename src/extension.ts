@@ -67,6 +67,7 @@ interface DiffMetadata {
 
 interface DiffComment extends vscode.Comment {
   bitbucketId: number;
+  thread: vscode.CommentThread;
 }
 
 type AiCommentKind = "loading" | "suggestion" | "draft";
@@ -428,12 +429,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await vscode.window.showTextDocument(fileUri, { preview: false });
   };
 
-  const toDiffComment = (comment: PullRequestComment): DiffComment => ({
-    body: new vscode.MarkdownString(comment.content?.raw ?? comment.content?.html ?? ""),
+  const toDiffComment = (comment: PullRequestComment, thread: vscode.CommentThread): DiffComment => ({
+    body: new vscode.MarkdownString(comment.deleted ? "_Comment deleted._" : comment.content?.raw ?? comment.content?.html ?? ""),
     mode: vscode.CommentMode.Preview,
     author: { name: comment.user?.display_name ?? "Unknown" },
     ...(comment.created_on ? { timestamp: new Date(comment.created_on) } : {}),
     bitbucketId: comment.id,
+    thread,
+    contextValue: comment.deleted ? undefined : "diffsparkPostedComment",
   });
 
   const loadInlineComments = async (
@@ -467,8 +470,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const thread = commentController.createCommentThread(
         uri,
         new vscode.Range(line - 1, 0, line - 1, 0),
-        [toDiffComment(comment)],
+        [],
       );
+      thread.comments = [toDiffComment(comment, thread)];
       threadByCommentId.set(comment.id, thread);
     }
 
@@ -478,7 +482,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const thread = threadByCommentId.get(comment.parent.id);
       if (thread) {
-        thread.comments = [...thread.comments, toDiffComment(comment)];
+        thread.comments = [...thread.comments, toDiffComment(comment, thread)];
       }
     }
   };
@@ -511,7 +515,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     const posted = thread.comments.filter((comment) => !isAiComment(comment));
     const drafts = thread.comments.filter(isAiComment);
-    thread.comments = [...posted, toDiffComment(created), ...drafts];
+    thread.comments = [...posted, toDiffComment(created, thread), ...drafts];
     return true;
   };
 
@@ -618,6 +622,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "bitbucketPrReviewer.deleteDiffComment",
+      (comment: DiffComment) => runAction(async () => {
+        if (!comment || comment.contextValue !== "diffsparkPostedComment" ||
+            !comment.thread?.comments.includes(comment)) {
+          throw new Error("This pull request comment is no longer available.");
+        }
+        const metadata = resolveDiffMetadata(comment.thread.uri);
+        const choice = await vscode.window.showWarningMessage(
+          "Delete this comment from Bitbucket? This cannot be undone. Replies will be kept.",
+          { modal: true },
+          "Delete",
+        );
+        if (choice !== "Delete") {
+          return;
+        }
+        await getClient().deleteComment(metadata.bitbucketRepository, metadata.pullRequestId, comment.bitbucketId);
+        comment.thread.comments = comment.thread.comments.map((item) =>
+          item === comment
+            ? { ...comment, body: new vscode.MarkdownString("_Comment deleted._"), contextValue: undefined }
+            : item,
+        );
+      }),
+    ),
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.createDiffComment",
       (reply: vscode.CommentReply) => runAction(async () => {

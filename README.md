@@ -16,6 +16,7 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
 - Opens a side-by-side diff when clicking a changed file, using the common ancestor and the PR source commit from Bitbucket, including added, removed, and renamed files. Add inline comments to changed lines and view existing inline discussions directly in the diff.
 - The diff editor toolbar can open the file from the current checkout or check out the pull request source branch and open the file. Checking out warns before changing a dirty worktree; source branches from forks require that fork to be configured as a Git remote.
 - Shows the pull request description and Markdown comments, supports Markdown comments and threaded replies, and can approve, request changes, or merge.
+- Delete published comments using the trash icon on a diff comment or **Delete** in the pull request view. Deletion requires confirmation and Bitbucket permission (normally the comment's author); permission errors are shown without removing the comment locally. Deleted comments remain as placeholders so replies are preserved.
 - **Request changes** uses Bitbucket's native change-request status and can optionally post a Markdown comment explaining what to adjust.
 - The merge dialog lets you choose a strategy, edit the commit message, and optionally close the source branch.
 - When Jira is connected, the merge dialog finds Jira issue keys in the PR title, description, and source branch. Select which issues to transition and their target statuses; Jira transitions run after the Bitbucket merge succeeds.

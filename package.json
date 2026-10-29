@@ -102,6 +102,11 @@
         "command": "bitbucketPrReviewer.replyDiffComment"
       },
       {
+        "title": "Delete comment",
+        "command": "bitbucketPrReviewer.deleteDiffComment",
+        "icon": "$(trash)"
+      },
+      {
         "title": "Improve comment",
         "command": "bitbucketPrReviewer.improveDiffComment",
         "icon": "$(wand)"
@@ -188,6 +193,7 @@
     },
     "menus": {
       "commandPalette": [
+        { "command": "bitbucketPrReviewer.deleteDiffComment", "when": "false" },
         { "command": "bitbucketPrReviewer.improveDiffComment", "when": "false" },
         { "command": "bitbucketPrReviewer.improveDiffCommentWith", "when": "false" },
         { "command": "bitbucketPrReviewer.aiSuggestionReplace", "when": "false" },
@@ -222,6 +228,11 @@
         }
       ],
       "comments/comment/context": [
+        {
+          "command": "bitbucketPrReviewer.deleteDiffComment",
+          "group": "inline@1",
+          "when": "commentController == diffspark && comment == diffsparkPostedComment"
+        },
         {
           "command": "bitbucketPrReviewer.aiSuggestionReplace",
           "group": "inline@1",

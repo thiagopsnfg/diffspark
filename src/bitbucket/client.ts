@@ -180,6 +180,14 @@ export class BitbucketClient {
     this.rememberAccountId(await this.request(new URL(path, API_ORIGIN).toString(), { method: "POST" }));
   }
 
+  deleteComment(repository: BitbucketRepository, pullRequestId: number, commentId: number): Promise<void> {
+    if (!Number.isSafeInteger(commentId) || commentId <= 0) {
+      throw new Error("Invalid pull request comment ID.");
+    }
+    const path = this.pullRequestPath(repository, pullRequestId, `/comments/${commentId}`);
+    return this.request(new URL(path, API_ORIGIN).toString(), { method: "DELETE" });
+  }
+
   unapprove(repository: BitbucketRepository, pullRequestId: number): Promise<void> {
     const path = this.pullRequestPath(repository, pullRequestId, "/approve");
     return this.request(new URL(path, API_ORIGIN).toString(), { method: "DELETE" });

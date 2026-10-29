@@ -210,6 +210,26 @@ export class PullRequestWebview {
         return;
       }
 
+      if (message.command === "deleteComment") {
+        const comment = this.comments.find((entry) => entry.id === message.commentId && !entry.deleted);
+        if (!comment) {
+          throw new Error("This pull request comment is no longer available.");
+        }
+        const choice = await vscode.window.showWarningMessage(
+          "Delete this comment from Bitbucket? This cannot be undone. Replies will be kept.",
+          { modal: true },
+          "Delete",
+        );
+        if (choice === "Delete") {
+          await this.client.deleteComment(this.repository, this.pullRequest.id, comment.id);
+          this.comments = this.comments.map((entry) =>
+            entry.id === comment.id ? { ...entry, deleted: true, content: undefined } : entry,
+          );
+          await this.panel.webview.postMessage({ command: "commentDeleted", commentId: comment.id });
+        }
+        return;
+      }
+
       if (message.command === "comment" || message.command === "reply") {
         const markdownText = message.markdown.trim();
         if (!markdownText || markdownText.length > 10_000) {
@@ -396,14 +416,16 @@ export class PullRequestWebview {
       `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
     const renderedComments = comments.map((comment) => {
       const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
-      const content = comment.content?.raw
+      const content = comment.deleted ? "<p><em>Comment deleted.</em></p>" : comment.content?.raw
         ? renderMarkdown(rawMarkdown)
         : sanitizeCommentHtml(rawMarkdown);
       const parentId = comment.parent?.id;
       const replyControl = parentId === undefined
         ? `<button class="secondary reply" data-parent="${comment.id}">Reply</button>`
         : "";
-      return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div>${replyControl}</article>`;
+      const deleteControl = comment.deleted ? "" :
+        `<button class="secondary delete-comment" data-comment-id="${comment.id}" aria-label="Delete comment">Delete</button>`;
+      return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
     }).join("");
 
     return `<!DOCTYPE html>
@@ -649,6 +671,9 @@ export class PullRequestWebview {
     const jiraIssues = document.getElementById("jira-issues");
     const connectJira = document.getElementById("connect-jira");
     let replyTo;
+    document.querySelectorAll(".delete-comment").forEach((button) => button.addEventListener("click", () => {
+      vscode.postMessage({ command: "deleteComment", commentId: Number(button.dataset.commentId) });
+    }));
     document.querySelectorAll(".reply").forEach((button) => button.addEventListener("click", () => {
       replyTo = Number(button.dataset.parent);
       title.textContent = "Reply to comment #" + replyTo;
@@ -875,6 +900,13 @@ export class PullRequestWebview {
     });
     window.addEventListener("message", (event) => {
       const message = event.data;
+      if (message.command === "commentDeleted") {
+        const comment = document.getElementById("comment-" + message.commentId);
+        if (comment) {
+          comment.querySelector(".markdown").textContent = "Comment deleted.";
+          comment.querySelector(".delete-comment")?.remove();
+        }
+      }
       if (message.command === "aiProvider") {
         document.getElementById("ai-provider-name").textContent = message.label;
         return;
@@ -1027,6 +1059,7 @@ export class PullRequestWebview {
 }
 
 type WebviewMessage =
+  | { command: "deleteComment"; commentId: number }
   | { command: "comment"; markdown: string }
   | { command: "reply"; markdown: string; parentId: number }
   | { command: "approve" }
@@ -1057,6 +1090,9 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
     return false;
   }
   const candidate = message as Record<string, unknown>;
+  if (candidate.command === "deleteComment") {
+    return Number.isSafeInteger(candidate.commentId) && Number(candidate.commentId) > 0;
+  }
   if (
     candidate.command === "approve" ||
     candidate.command === "requestChanges" ||

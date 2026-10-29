@@ -53,6 +53,7 @@ export type HttpMethod = "GET" | "POST" | "DELETE";
 
 export interface PullRequestComment {
   id: number;
+  deleted?: boolean;
   content?: {
     raw?: string;
     html?: string;
