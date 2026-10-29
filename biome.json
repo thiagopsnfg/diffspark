@@ -1,0 +1,169 @@
+{
+    "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+    "assist": {
+        "actions": {
+            "source": {
+                "organizeImports": "off"
+            }
+        }
+    },
+    "formatter": {
+        "enabled": true,
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineWidth": 90,
+        "lineEnding": "lf",
+        "includes": [
+            "**",
+            "!**/.vscode",
+            "!**/node_modules",
+            "!**/package.json",
+            "!**/package-lock.json"
+        ]
+    },
+    "overrides": [
+        {
+            "includes": ["**/src/app/i18n/**/*"],
+            "formatter": {
+                "lineWidth": 320
+            }
+        },
+        {
+            "includes": ["**/test/**"],
+            "linter": {
+                "rules": {
+                    "suspicious": {
+                        "useAwait": "off",
+                        "noEmptyBlockStatements": "off"
+                    },
+                    "correctness": {
+                        "noConstructorReturn": "off"
+                    }
+                }
+            }
+        }
+    ],
+    "files": {
+        "includes": [
+            "**",
+            "!**/dist",
+            "!**/.vscode",
+            "!**/build",
+            "!**/*.html",
+            "!**/public",
+            "!**/.cache",
+            "!**/coverage",
+            "!**/*.min.js",
+            "!**/*.bundle.js",
+            "!**/node_modules"
+        ]
+    },
+    "javascript": {
+        "globals": [
+            "it",
+            "jest",
+            "test",
+            "after",
+            "expect",
+            "before",
+            "describe",
+            "beforeAll",
+            "xdescribe",
+            "afterEach",
+            "beforeEach"
+        ],
+        "formatter": {
+            "semicolons": "always",
+            "trailingCommas": "all",
+            "bracketSpacing": false,
+            "bracketSameLine": false,
+            "jsxQuoteStyle": "double",
+            "arrowParentheses": "always",
+            "quoteProperties": "asNeeded"
+        }
+    },
+    "json": {
+        "parser": {
+            "allowComments": true,
+            "allowTrailingCommas": true
+        },
+        "formatter": {
+            "enabled": true,
+            "indentStyle": "space",
+            "indentWidth": 4,
+            "lineEnding": "lf"
+        }
+    },
+    "linter": {
+        "enabled": true,
+        "includes": [
+            "**",
+            "!**/node_modules",
+            "!**/package.json",
+            "!**/package-lock.json"
+        ],
+        "rules": {
+            "preset": "recommended",
+            "style": {
+                "useConst": "warn",
+                "noNonNullAssertion": "off",
+                "useTemplate": "off",
+                "noParameterAssign": "off",
+                "useBlockStatements": "off",
+                "noShoutyConstants": "error",
+                "useFragmentSyntax": "error",
+                "useNumberNamespace": "error",
+                "useDefaultParameterLast": "off",
+                "noRestrictedImports": {
+                    "level": "error",
+                    "options": {
+                        "paths": {
+                            "@mui/material": "Use direct MUI imports. Ex: import Box from '@mui/material/Box';"
+                        }
+                    }
+                }
+            },
+            "suspicious": {
+                "noConsole": "off",
+                "useAwait": "error",
+                "noExplicitAny": "off",
+                "noThenProperty": "off",
+                "noGlobalAssign": "off",
+                "noArrayIndexKey": "warn",
+                "noEmptyBlockStatements": "error",
+                "useIterableCallbackReturn": "off",
+                "noMisleadingCharacterClass": "off",
+                "noControlCharactersInRegex": "warn",
+                "noApproximativeNumericConstant": "error",
+                "noMisrefactoredShorthandAssign": "error"
+            },
+            "complexity": {
+                "noForEach": "off",
+                "useArrowFunction": "off",
+                "noStaticOnlyClass": "off",
+                "useSimplifiedLogicExpression": "off"
+            },
+            "correctness": {
+                "useHookAtTopLevel": "off",
+                "noUnusedImports": "warn",
+                "noUnusedVariables": "warn",
+                "noUndeclaredVariables": "error",
+                "useExhaustiveDependencies": "off",
+                "noInvalidUseBeforeDeclaration": "error"
+            },
+            "a11y": {
+                "useAltText": "off",
+                "useValidAnchor": "off",
+                "useMediaCaption": "off",
+                "noSvgWithoutTitle": "off",
+                "useKeyWithClickEvents": "off"
+            },
+            "security": {
+                "noDangerouslySetInnerHtml": "error"
+            },
+            "performance": {
+                "noDynamicNamespaceImportAccess": "off"
+            }
+        }
+    }
+}

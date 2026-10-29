@@ -467,6 +467,10 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
     "test": "npm run compile && node --test test/*.test.js",
     "test:coverage": "npm run compile && c8 --include='dist/bitbucket/**/*.js' --include='dist/views/markdown.js' --reporter=text --reporter=lcov node --test test/*.test.js",
     "vscode:prepublish": "npm run compile"
@@ -478,6 +482,7 @@
     "sanitize-html": "^2.14.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.14",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.19.43",
     "@types/sanitize-html": "^2.13.0",

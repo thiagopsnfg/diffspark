@@ -1,532 +1,624 @@
 import * as vscode from "vscode";
-import { BitbucketClient } from "../bitbucket/client";
-import { extractJiraIssueKeys } from "../jira/issues";
-import { JiraClient, JiraTransition } from "../jira/client";
-import { renderMarkdown, sanitizeCommentHtml } from "./markdown";
-import { BitbucketRepository, MergeStrategy, PullRequest, PullRequestComment, ReviewState } from "../bitbucket/types";
-import { CommentImprover } from "../ai/service";
+import type {BitbucketClient} from "../bitbucket/client";
+import {extractJiraIssueKeys} from "../jira/issues";
+import type {JiraClient, JiraTransition} from "../jira/client";
+import {renderMarkdown, sanitizeCommentHtml} from "./markdown";
+import type {
+    BitbucketRepository,
+    MergeStrategy,
+    PullRequest,
+    PullRequestComment,
+    ReviewState,
+} from "../bitbucket/types";
+import type {CommentImprover} from "../ai/service";
 import {
-  describeImproveOptions,
-  IMPROVE_ACTIONS,
-  IMPROVE_TONES,
-  ImproveOptions,
-  isImproveAction,
-  isImproveTone,
-  TRANSLATE_LANGUAGES,
+    describeImproveOptions,
+    IMPROVE_ACTIONS,
+    IMPROVE_TONES,
+    type ImproveOptions,
+    isImproveAction,
+    isImproveTone,
+    TRANSLATE_LANGUAGES,
 } from "../ai/prompt";
-import { AiReviewState } from "../ai/review/runner";
-import { AiReviewFinding, FindingStatus, REVIEW_SEVERITIES } from "../ai/review/types";
-import { categoryLabel, SEVERITY_LABELS, VERDICT_LABELS } from "../ai/review/parse";
+import type {AiReviewState} from "../ai/review/runner";
+import {
+    type AiReviewFinding,
+    type FindingStatus,
+    REVIEW_SEVERITIES,
+} from "../ai/review/types";
+import {categoryLabel, SEVERITY_LABELS, VERDICT_LABELS} from "../ai/review/parse";
 
 /** Bridge between the pull request view and the AI reviewer (implemented in extension.ts). */
 export interface AiReviewHost {
-  getState(): AiReviewState;
-  onDidChange(listener: () => void): vscode.Disposable;
-  run(): Promise<void>;
-  cancel(): void;
-  clear(): Promise<void>;
-  editRules(): Promise<void>;
-  openFinding(id: string): Promise<void>;
-  setFindingStatus(ids: string[], status: FindingStatus): Promise<void>;
-  postFindings(ids: string[]): Promise<number>;
-  postSummary(): Promise<void>;
+    getState(): AiReviewState;
+    onDidChange(listener: () => void): vscode.Disposable;
+    run(): Promise<void>;
+    cancel(): void;
+    clear(): Promise<void>;
+    editRules(): Promise<void>;
+    openFinding(id: string): Promise<void>;
+    setFindingStatus(ids: string[], status: FindingStatus): Promise<void>;
+    postFindings(ids: string[]): Promise<number>;
+    postSummary(): Promise<void>;
 }
 
 interface MergeIssueOption {
-  key: string;
-  summary: string;
-  issueType: string;
-  transitions: JiraTransition[];
-  error?: string;
+    key: string;
+    summary: string;
+    issueType: string;
+    transitions: JiraTransition[];
+    error?: string;
 }
 
 export class PullRequestWebview {
-  private static readonly openViews = new Map<string, PullRequestWebview>();
-  private disposed = false;
-  private reviewState: ReviewState = "none";
-  private readonly availableTransitions = new Map<string, Set<string>>();
-  private readonly panel: vscode.WebviewPanel;
-  private comments: PullRequestComment[] = [];
-  private improveCancellation: vscode.CancellationTokenSource | undefined;
+    private static readonly openViews = new Map<string, PullRequestWebview>();
+    private disposed = false;
+    private reviewState: ReviewState = "none";
+    private readonly availableTransitions = new Map<string, Set<string>>();
+    private readonly panel: vscode.WebviewPanel;
+    private comments: PullRequestComment[] = [];
+    private improveCancellation: vscode.CancellationTokenSource | undefined;
 
-  private constructor(
-    private readonly pullRequest: PullRequest,
-    private readonly repository: BitbucketRepository,
-    private readonly client: BitbucketClient,
-    private readonly onError: (error: unknown) => void,
-    private readonly onMerged: () => void,
-    private readonly getJiraClient: () => JiraClient | undefined,
-    private readonly ensureJiraClient: () => Promise<boolean>,
-    private readonly improver: CommentImprover,
-    private readonly aiReview?: AiReviewHost,
-  ) {
-    this.panel = vscode.window.createWebviewPanel(
-      "bitbucketPullRequest",
-      `PR #${pullRequest.id}: ${pullRequest.title}`,
-      vscode.ViewColumn.Active,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    const aiReviewSubscription = aiReview?.onDidChange(() => {
-      void this.pushAiReview();
-    });
-    this.panel.onDidDispose(() => {
-      this.disposed = true;
-      PullRequestWebview.openViews.delete(this.viewKey);
-      aiReviewSubscription?.dispose();
-      this.improveCancellation?.cancel();
-      this.improveCancellation?.dispose();
-    });
-    this.panel.webview.onDidReceiveMessage((message: unknown) => {
-      void this.handleMessage(message);
-    });
-  }
-
-  static async open(
-    pullRequest: PullRequest,
-    repository: BitbucketRepository,
-    client: BitbucketClient,
-    onError: (error: unknown) => void,
-    onMerged: () => void,
-    getJiraClient: () => JiraClient | undefined,
-    ensureJiraClient: () => Promise<boolean>,
-    improver: CommentImprover,
-    aiReview?: AiReviewHost,
-  ): Promise<PullRequestWebview> {
-    const existing = PullRequestWebview.openViews.get(`${repository.fullName}#${pullRequest.id}`);
-    if (existing && !existing.disposed) {
-      existing.panel.reveal?.();
-      return existing;
-    }
-    const view = new PullRequestWebview(
-      pullRequest,
-      repository,
-      client,
-      onError,
-      onMerged,
-      getJiraClient,
-      ensureJiraClient,
-      improver,
-      aiReview,
-    );
-    PullRequestWebview.openViews.set(view.viewKey, view);
-    await view.refresh();
-    return view;
-  }
-
-  private get viewKey(): string {
-    return `${this.repository.fullName}#${this.pullRequest.id}`;
-  }
-
-  private async pushAiReview(): Promise<void> {
-    if (!this.disposed && this.aiReview) {
-      await this.panel.webview.postMessage({ command: "aiReviewHtml", html: this.renderAiReview() });
-    }
-  }
-
-  private renderAiReview(): string {
-    return this.aiReview ? renderAiReviewSection(this.aiReview.getState(), this.pullRequest.source.commit?.hash) : "";
-  }
-
-  private async handleAiReviewMessage(
-    message: Extract<WebviewMessage, { command: "aiReview" | "aiReviewFindings" }>,
-  ): Promise<void> {
-    const host = this.aiReview;
-    if (!host) {
-      throw new Error("The AI review is not available in this view.");
-    }
-    if (message.command === "aiReview") {
-      switch (message.action) {
-        case "run":
-          await host.run();
-          return;
-        case "cancel":
-          host.cancel();
-          return;
-        case "clear":
-          await host.clear();
-          return;
-        case "editRules":
-          await host.editRules();
-          return;
-        case "postSummary":
-          await host.postSummary();
-          void vscode.window.showInformationMessage("DiffSpark: AI review summary posted as a comment.");
-          await this.refresh();
-          return;
-      }
-    }
-    switch (message.action) {
-      case "open":
-        await host.openFinding(message.ids[0]);
-        return;
-      case "dismiss":
-        await host.setFindingStatus(message.ids, "dismissed");
-        return;
-      case "restore":
-        await host.setFindingStatus(message.ids, "open");
-        return;
-      case "post":
-        try {
-          await host.postFindings(message.ids);
-        } finally {
-          await this.refresh();
-        }
-        return;
-    }
-  }
-
-  private async refresh(): Promise<void> {
-    const [comments, reviewState] = await Promise.all([
-      this.client.getComments(this.repository, this.pullRequest.id),
-      this.client.getMyReviewState(this.repository, this.pullRequest.id),
-    ]);
-    this.reviewState = reviewState;
-    this.comments = comments.filter((comment) => !comment.deleted);
-    if (!this.disposed) {
-      this.panel.webview.html = this.render(this.comments);
-    }
-  }
-
-  private async improveComment(
-    requestId: number,
-    markdown: string,
-    options: ImproveOptions,
-    parentId: number | undefined,
-  ): Promise<void> {
-    this.improveCancellation?.cancel();
-    this.improveCancellation?.dispose();
-    const cancellation = new vscode.CancellationTokenSource();
-    this.improveCancellation = cancellation;
-    const parent = parentId === undefined ? undefined : this.comments.find((comment) => comment.id === parentId);
-    const discussion = parent
-      ? [parent, ...this.comments.filter((comment) => comment.parent?.id === parent.id)].map(
-          (comment) => `${comment.user?.display_name ?? "Unknown"}: ${comment.content?.raw ?? ""}`,
-        )
-      : [];
-    try {
-      const suggestion = await this.improver.improve(
-        {
-          ...options,
-          comment: markdown,
-          pullRequestTitle: this.pullRequest.title,
-          pullRequestDescription: this.pullRequest.description,
-          discussion,
-          filePath: parent?.inline?.path,
-        },
-        cancellation.token,
-      );
-      if (!this.disposed && this.improveCancellation === cancellation) {
-        await this.panel.webview.postMessage({
-          command: "improveResult",
-          requestId,
-          suggestion,
-          label: describeImproveOptions(options),
-          provider: this.improver.getProviderLabel(),
-        });
-      }
-    } catch (error) {
-      if (!this.disposed && this.improveCancellation === cancellation) {
-        const cancelled = error instanceof vscode.CancellationError;
-        await this.panel.webview.postMessage({
-          command: "improveFailed",
-          requestId,
-          message: cancelled ? "" : errorMessage(error),
-        });
-      }
-    } finally {
-      if (this.improveCancellation === cancellation) {
-        this.improveCancellation = undefined;
-      }
-      cancellation.dispose();
-    }
-  }
-
-  private async handleMessage(message: unknown): Promise<void> {
-    if (!isWebviewMessage(message)) {
-      this.onError(new Error("Received an invalid pull request view message."));
-      if (message && typeof message === "object" && "command" in message && message.command === "merge") {
-        await this.panel.webview.postMessage({ command: "mergeFailed" });
-      }
-      if (message && typeof message === "object" && "command" in message && message.command === "improveComment") {
-        const requestId = (message as { requestId?: unknown }).requestId;
-        await this.panel.webview.postMessage({
-          command: "improveFailed",
-          requestId,
-          message: "The comment must contain 1–10,000 characters.",
-        });
-      }
-      return;
-    }
-
-    try {
-      if (message.command === "approve") {
-        await this.approve();
-        return;
-      }
-      if (message.command === "requestChanges") {
-        await this.requestChanges();
-        return;
-      }
-      if (message.command === "loadMergeOptions") {
-        await this.loadMergeOptions();
-        return;
-      }
-      if (message.command === "connectJira") {
-        await this.ensureJiraClient();
-        await this.loadMergeOptions();
-        return;
-      }
-      if (message.command === "improveComment") {
-        await this.improveComment(
-          message.requestId,
-          message.markdown,
-          { action: message.action, tone: message.tone, targetLanguage: message.targetLanguage },
-          message.parentId,
+    private constructor(
+        private readonly pullRequest: PullRequest,
+        private readonly repository: BitbucketRepository,
+        private readonly client: BitbucketClient,
+        private readonly onError: (error: unknown) => void,
+        private readonly onMerged: () => void,
+        private readonly getJiraClient: () => JiraClient | undefined,
+        private readonly ensureJiraClient: () => Promise<boolean>,
+        private readonly improver: CommentImprover,
+        private readonly aiReview?: AiReviewHost,
+    ) {
+        this.panel = vscode.window.createWebviewPanel(
+            "bitbucketPullRequest",
+            `PR #${pullRequest.id}: ${pullRequest.title}`,
+            vscode.ViewColumn.Active,
+            {enableScripts: true, retainContextWhenHidden: true},
         );
-        return;
-      }
-      if (message.command === "cancelImprove") {
+        const aiReviewSubscription = aiReview?.onDidChange(() => {
+            void this.pushAiReview();
+        });
+        this.panel.onDidDispose(() => {
+            this.disposed = true;
+            PullRequestWebview.openViews.delete(this.viewKey);
+            aiReviewSubscription?.dispose();
+            this.improveCancellation?.cancel();
+            this.improveCancellation?.dispose();
+        });
+        this.panel.webview.onDidReceiveMessage((message: unknown) => {
+            void this.handleMessage(message);
+        });
+    }
+
+    static async open(
+        pullRequest: PullRequest,
+        repository: BitbucketRepository,
+        client: BitbucketClient,
+        onError: (error: unknown) => void,
+        onMerged: () => void,
+        getJiraClient: () => JiraClient | undefined,
+        ensureJiraClient: () => Promise<boolean>,
+        improver: CommentImprover,
+        aiReview?: AiReviewHost,
+    ): Promise<PullRequestWebview> {
+        const existing = PullRequestWebview.openViews.get(
+            `${repository.fullName}#${pullRequest.id}`,
+        );
+        if (existing && !existing.disposed) {
+            existing.panel.reveal?.();
+            return existing;
+        }
+        const view = new PullRequestWebview(
+            pullRequest,
+            repository,
+            client,
+            onError,
+            onMerged,
+            getJiraClient,
+            ensureJiraClient,
+            improver,
+            aiReview,
+        );
+        PullRequestWebview.openViews.set(view.viewKey, view);
+        await view.refresh();
+        return view;
+    }
+
+    private get viewKey(): string {
+        return `${this.repository.fullName}#${this.pullRequest.id}`;
+    }
+
+    private async pushAiReview(): Promise<void> {
+        if (!this.disposed && this.aiReview) {
+            await this.panel.webview.postMessage({
+                command: "aiReviewHtml",
+                html: this.renderAiReview(),
+            });
+        }
+    }
+
+    private renderAiReview(): string {
+        return this.aiReview
+            ? renderAiReviewSection(
+                  this.aiReview.getState(),
+                  this.pullRequest.source.commit?.hash,
+              )
+            : "";
+    }
+
+    private async handleAiReviewMessage(
+        message: Extract<WebviewMessage, {command: "aiReview" | "aiReviewFindings"}>,
+    ): Promise<void> {
+        const host = this.aiReview;
+        if (!host) {
+            throw new Error("The AI review is not available in this view.");
+        }
+        if (message.command === "aiReview") {
+            switch (message.action) {
+                case "run":
+                    await host.run();
+                    return;
+                case "cancel":
+                    host.cancel();
+                    return;
+                case "clear":
+                    await host.clear();
+                    return;
+                case "editRules":
+                    await host.editRules();
+                    return;
+                case "postSummary":
+                    await host.postSummary();
+                    void vscode.window.showInformationMessage(
+                        "DiffSpark: AI review summary posted as a comment.",
+                    );
+                    await this.refresh();
+                    return;
+            }
+        }
+        switch (message.action) {
+            case "open":
+                await host.openFinding(message.ids[0]);
+                return;
+            case "dismiss":
+                await host.setFindingStatus(message.ids, "dismissed");
+                return;
+            case "restore":
+                await host.setFindingStatus(message.ids, "open");
+                return;
+            case "post":
+                try {
+                    await host.postFindings(message.ids);
+                } finally {
+                    await this.refresh();
+                }
+                return;
+        }
+    }
+
+    private async refresh(): Promise<void> {
+        const [comments, reviewState] = await Promise.all([
+            this.client.getComments(this.repository, this.pullRequest.id),
+            this.client.getMyReviewState(this.repository, this.pullRequest.id),
+        ]);
+        this.reviewState = reviewState;
+        this.comments = comments.filter((comment) => !comment.deleted);
+        if (!this.disposed) {
+            this.panel.webview.html = this.render(this.comments);
+        }
+    }
+
+    private async improveComment(
+        requestId: number,
+        markdown: string,
+        options: ImproveOptions,
+        parentId: number | undefined,
+    ): Promise<void> {
         this.improveCancellation?.cancel();
-        return;
-      }
-      if (message.command === "aiReview" || message.command === "aiReviewFindings") {
-        await this.handleAiReviewMessage(message);
-        return;
-      }
-      if (message.command === "configureAi") {
-        await this.improver.selectProvider();
-        await this.panel.webview.postMessage({ command: "aiProvider", label: this.improver.getProviderLabel() });
-        return;
-      }
-      if (message.command === "merge") {
-        await this.merge(
-          message.strategy,
-          message.closeSourceBranch,
-          message.commitMessage,
-          message.transitions,
-        );
-        return;
-      }
-
-      if (message.command === "deleteComment") {
-        const comment = this.comments.find((entry) => entry.id === message.commentId && !entry.deleted);
-        if (!comment) {
-          throw new Error("This pull request comment is no longer available.");
+        this.improveCancellation?.dispose();
+        const cancellation = new vscode.CancellationTokenSource();
+        this.improveCancellation = cancellation;
+        const parent =
+            parentId === undefined
+                ? undefined
+                : this.comments.find((comment) => comment.id === parentId);
+        const discussion = parent
+            ? [
+                  parent,
+                  ...this.comments.filter((comment) => comment.parent?.id === parent.id),
+              ].map(
+                  (comment) =>
+                      `${comment.user?.display_name ?? "Unknown"}: ${comment.content?.raw ?? ""}`,
+              )
+            : [];
+        try {
+            const suggestion = await this.improver.improve(
+                {
+                    ...options,
+                    comment: markdown,
+                    pullRequestTitle: this.pullRequest.title,
+                    pullRequestDescription: this.pullRequest.description,
+                    discussion,
+                    filePath: parent?.inline?.path,
+                },
+                cancellation.token,
+            );
+            if (!this.disposed && this.improveCancellation === cancellation) {
+                await this.panel.webview.postMessage({
+                    command: "improveResult",
+                    requestId,
+                    suggestion,
+                    label: describeImproveOptions(options),
+                    provider: this.improver.getProviderLabel(),
+                });
+            }
+        } catch (error) {
+            if (!this.disposed && this.improveCancellation === cancellation) {
+                const cancelled = error instanceof vscode.CancellationError;
+                await this.panel.webview.postMessage({
+                    command: "improveFailed",
+                    requestId,
+                    message: cancelled ? "" : errorMessage(error),
+                });
+            }
+        } finally {
+            if (this.improveCancellation === cancellation) {
+                this.improveCancellation = undefined;
+            }
+            cancellation.dispose();
         }
+    }
+
+    private async handleMessage(message: unknown): Promise<void> {
+        if (!isWebviewMessage(message)) {
+            this.onError(new Error("Received an invalid pull request view message."));
+            if (
+                message &&
+                typeof message === "object" &&
+                "command" in message &&
+                message.command === "merge"
+            ) {
+                await this.panel.webview.postMessage({command: "mergeFailed"});
+            }
+            if (
+                message &&
+                typeof message === "object" &&
+                "command" in message &&
+                message.command === "improveComment"
+            ) {
+                const requestId = (message as {requestId?: unknown}).requestId;
+                await this.panel.webview.postMessage({
+                    command: "improveFailed",
+                    requestId,
+                    message: "The comment must contain 1–10,000 characters.",
+                });
+            }
+            return;
+        }
+
+        try {
+            if (message.command === "approve") {
+                await this.approve();
+                return;
+            }
+            if (message.command === "requestChanges") {
+                await this.requestChanges();
+                return;
+            }
+            if (message.command === "loadMergeOptions") {
+                await this.loadMergeOptions();
+                return;
+            }
+            if (message.command === "connectJira") {
+                await this.ensureJiraClient();
+                await this.loadMergeOptions();
+                return;
+            }
+            if (message.command === "improveComment") {
+                await this.improveComment(
+                    message.requestId,
+                    message.markdown,
+                    {
+                        action: message.action,
+                        tone: message.tone,
+                        targetLanguage: message.targetLanguage,
+                    },
+                    message.parentId,
+                );
+                return;
+            }
+            if (message.command === "cancelImprove") {
+                this.improveCancellation?.cancel();
+                return;
+            }
+            if (
+                message.command === "aiReview" ||
+                message.command === "aiReviewFindings"
+            ) {
+                await this.handleAiReviewMessage(message);
+                return;
+            }
+            if (message.command === "configureAi") {
+                await this.improver.selectProvider();
+                await this.panel.webview.postMessage({
+                    command: "aiProvider",
+                    label: this.improver.getProviderLabel(),
+                });
+                return;
+            }
+            if (message.command === "merge") {
+                await this.merge(
+                    message.strategy,
+                    message.closeSourceBranch,
+                    message.commitMessage,
+                    message.transitions,
+                );
+                return;
+            }
+
+            if (message.command === "deleteComment") {
+                const comment = this.comments.find(
+                    (entry) => entry.id === message.commentId && !entry.deleted,
+                );
+                if (!comment) {
+                    throw new Error("This pull request comment is no longer available.");
+                }
+                const choice = await vscode.window.showWarningMessage(
+                    "Delete this comment from Bitbucket? This cannot be undone. Replies will be kept.",
+                    {modal: true},
+                    "Delete",
+                );
+                if (choice === "Delete") {
+                    await this.client.deleteComment(
+                        this.repository,
+                        this.pullRequest.id,
+                        comment.id,
+                    );
+                    this.comments = this.comments.filter(
+                        (entry) => entry.id !== comment.id,
+                    );
+                    await this.panel.webview.postMessage({
+                        command: "commentDeleted",
+                        commentId: comment.id,
+                    });
+                }
+                return;
+            }
+
+            if (message.command === "comment" || message.command === "reply") {
+                const markdownText = message.markdown.trim();
+                if (!markdownText || markdownText.length > 10_000) {
+                    throw new Error("Comments must contain 1–10,000 characters.");
+                }
+                await this.client.createComment(
+                    this.repository,
+                    this.pullRequest.id,
+                    markdownText,
+                    message.command === "reply" ? message.parentId : undefined,
+                );
+                await this.refresh();
+                return;
+            }
+        } catch (error) {
+            this.onError(error);
+            if (message.command === "merge") {
+                await this.panel.webview.postMessage({command: "mergeFailed"});
+            } else if (message.command === "connectJira") {
+                await this.loadMergeOptions();
+            } else if (
+                message.command === "aiReview" ||
+                message.command === "aiReviewFindings"
+            ) {
+                await this.pushAiReview();
+            }
+        }
+    }
+
+    private async approve(): Promise<void> {
+        const approved = this.reviewState === "approved";
+        const action = approved ? "Unapprove" : "Approve";
         const choice = await vscode.window.showWarningMessage(
-          "Delete this comment from Bitbucket? This cannot be undone. Replies will be kept.",
-          { modal: true },
-          "Delete",
+            `${action} pull request #${this.pullRequest.id}?`,
+            {modal: true},
+            action,
         );
-        if (choice === "Delete") {
-          await this.client.deleteComment(this.repository, this.pullRequest.id, comment.id);
-          this.comments = this.comments.filter((entry) => entry.id !== comment.id);
-          await this.panel.webview.postMessage({ command: "commentDeleted", commentId: comment.id });
+        if (choice !== action) {
+            return;
         }
-        return;
-      }
-
-      if (message.command === "comment" || message.command === "reply") {
-        const markdownText = message.markdown.trim();
-        if (!markdownText || markdownText.length > 10_000) {
-          throw new Error("Comments must contain 1–10,000 characters.");
+        if (approved) {
+            await this.client.unapprove(this.repository, this.pullRequest.id);
+        } else {
+            await this.client.approve(this.repository, this.pullRequest.id);
         }
-        await this.client.createComment(
-          this.repository,
-          this.pullRequest.id,
-          markdownText,
-          message.command === "reply" ? message.parentId : undefined,
+        void vscode.window.showInformationMessage(
+            `Pull request #${this.pullRequest.id} ${approved ? "unapproved" : "approved"}.`,
         );
         await this.refresh();
-        return;
-      }
-    } catch (error) {
-      this.onError(error);
-      if (message.command === "merge") {
-        await this.panel.webview.postMessage({ command: "mergeFailed" });
-      } else if (message.command === "connectJira") {
-        await this.loadMergeOptions();
-      } else if (message.command === "aiReview" || message.command === "aiReviewFindings") {
-        await this.pushAiReview();
-      }
-    }
-  }
-
-  private async approve(): Promise<void> {
-    const approved = this.reviewState === "approved";
-    const action = approved ? "Unapprove" : "Approve";
-    const choice = await vscode.window.showWarningMessage(
-      `${action} pull request #${this.pullRequest.id}?`,
-      { modal: true },
-      action,
-    );
-    if (choice !== action) {
-      return;
-    }
-    if (approved) {
-      await this.client.unapprove(this.repository, this.pullRequest.id);
-    } else {
-      await this.client.approve(this.repository, this.pullRequest.id);
-    }
-    void vscode.window.showInformationMessage(
-      `Pull request #${this.pullRequest.id} ${approved ? "unapproved" : "approved"}.`,
-    );
-    await this.refresh();
-  }
-
-  private async requestChanges(): Promise<void> {
-    if (this.reviewState === "changes_requested") {
-      await this.client.removeChangeRequest(this.repository, this.pullRequest.id);
-      void vscode.window.showInformationMessage(`Change request removed from pull request #${this.pullRequest.id}.`);
-      await this.refresh();
-      return;
-    }
-    const reason = await vscode.window.showInputBox({
-      title: `Request changes on pull request #${this.pullRequest.id}`,
-      prompt: "Optionally describe what needs to change. It will be posted as a Markdown comment.",
-      placeHolder: "What should be adjusted? (optional)",
-      ignoreFocusOut: true,
-      validateInput: (value) => value.trim().length > 10_000 ? "Comments must contain at most 10,000 characters." : undefined,
-    });
-    if (reason === undefined) {
-      return;
-    }
-    await this.client.requestChanges(this.repository, this.pullRequest.id);
-    await this.refresh();
-    const comment = reason.trim();
-    if (comment) {
-      await this.client.createComment(this.repository, this.pullRequest.id, comment);
-    }
-    void vscode.window.showInformationMessage(`Changes requested on pull request #${this.pullRequest.id}.`);
-    await this.refresh();
-  }
-
-  private async loadMergeOptions(): Promise<void> {
-    const jira = this.getJiraClient();
-    this.availableTransitions.clear();
-    if (!jira) {
-      await this.panel.webview.postMessage({
-        command: "mergeOptions",
-        jiraConfigured: false,
-        issues: [],
-      });
-      return;
     }
 
-    const keys = extractJiraIssueKeys(this.pullRequest);
-    const issues = await Promise.all(keys.map(async (key): Promise<MergeIssueOption> => {
-      const [issueResult, transitionsResult] = await Promise.allSettled([
-        jira.getIssue(key),
-        jira.getTransitions(key),
-      ]);
-      if (issueResult.status === "rejected") {
-        return {
-          key,
-          summary: key,
-          issueType: "",
-          transitions: [],
-          error: errorMessage(issueResult.reason),
-        };
-      }
-      if (transitionsResult.status === "rejected") {
-        return {
-          ...issueResult.value,
-          transitions: [],
-          error: errorMessage(transitionsResult.reason),
-        };
-      }
-      this.availableTransitions.set(
-        key,
-        new Set(transitionsResult.value.map((transition) => transition.id)),
-      );
-      return { ...issueResult.value, transitions: transitionsResult.value };
-    }));
-
-    if (!this.disposed) {
-      await this.panel.webview.postMessage({
-        command: "mergeOptions",
-        jiraConfigured: true,
-        issues,
-      });
-    }
-  }
-
-  private async merge(
-    strategy: MergeStrategy,
-    closeSourceBranch: boolean,
-    commitMessage: string,
-    transitions: { issueKey: string; transitionId: string }[],
-  ): Promise<void> {
-    if (!commitMessage.trim() || commitMessage.length > 10_000) {
-      throw new Error("The commit message must contain 1–10,000 characters.");
-    }
-    if (new Set(transitions.map(({ issueKey }) => issueKey)).size !== transitions.length) {
-      throw new Error("Select at most one transition per Jira issue.");
-    }
-    for (const transition of transitions) {
-      if (!this.availableTransitions.get(transition.issueKey)?.has(transition.transitionId)) {
-        throw new Error(`The selected Jira transition for ${transition.issueKey} is not available.`);
-      }
+    private async requestChanges(): Promise<void> {
+        if (this.reviewState === "changes_requested") {
+            await this.client.removeChangeRequest(this.repository, this.pullRequest.id);
+            void vscode.window.showInformationMessage(
+                `Change request removed from pull request #${this.pullRequest.id}.`,
+            );
+            await this.refresh();
+            return;
+        }
+        const reason = await vscode.window.showInputBox({
+            title: `Request changes on pull request #${this.pullRequest.id}`,
+            prompt: "Optionally describe what needs to change. It will be posted as a Markdown comment.",
+            placeHolder: "What should be adjusted? (optional)",
+            ignoreFocusOut: true,
+            validateInput: (value) =>
+                value.trim().length > 10_000
+                    ? "Comments must contain at most 10,000 characters."
+                    : undefined,
+        });
+        if (reason === undefined) {
+            return;
+        }
+        await this.client.requestChanges(this.repository, this.pullRequest.id);
+        await this.refresh();
+        const comment = reason.trim();
+        if (comment) {
+            await this.client.createComment(
+                this.repository,
+                this.pullRequest.id,
+                comment,
+            );
+        }
+        void vscode.window.showInformationMessage(
+            `Changes requested on pull request #${this.pullRequest.id}.`,
+        );
+        await this.refresh();
     }
 
-    const jira = this.getJiraClient();
-    if (transitions.length > 0 && !jira) {
-      throw new Error("Connect to Jira before applying issue transitions.");
+    private async loadMergeOptions(): Promise<void> {
+        const jira = this.getJiraClient();
+        this.availableTransitions.clear();
+        if (!jira) {
+            await this.panel.webview.postMessage({
+                command: "mergeOptions",
+                jiraConfigured: false,
+                issues: [],
+            });
+            return;
+        }
+
+        const keys = extractJiraIssueKeys(this.pullRequest);
+        const issues = await Promise.all(
+            keys.map(async (key): Promise<MergeIssueOption> => {
+                const [issueResult, transitionsResult] = await Promise.allSettled([
+                    jira.getIssue(key),
+                    jira.getTransitions(key),
+                ]);
+                if (issueResult.status === "rejected") {
+                    return {
+                        key,
+                        summary: key,
+                        issueType: "",
+                        transitions: [],
+                        error: errorMessage(issueResult.reason),
+                    };
+                }
+                if (transitionsResult.status === "rejected") {
+                    return {
+                        ...issueResult.value,
+                        transitions: [],
+                        error: errorMessage(transitionsResult.reason),
+                    };
+                }
+                this.availableTransitions.set(
+                    key,
+                    new Set(transitionsResult.value.map((transition) => transition.id)),
+                );
+                return {...issueResult.value, transitions: transitionsResult.value};
+            }),
+        );
+
+        if (!this.disposed) {
+            await this.panel.webview.postMessage({
+                command: "mergeOptions",
+                jiraConfigured: true,
+                issues,
+            });
+        }
     }
 
-    await this.client.merge(
-      this.repository,
-      this.pullRequest.id,
-      strategy,
-      closeSourceBranch,
-      commitMessage.trim(),
-    );
-    this.onMerged();
-    const results = await Promise.allSettled(
-      transitions.map(({ issueKey, transitionId }) => jira!.transition(issueKey, transitionId)),
-    );
-    const failures = results.flatMap((result, index) =>
-      result.status === "rejected"
-        ? [`${transitions[index].issueKey}: ${errorMessage(result.reason)}`]
-        : [],
-    );
-    void vscode.window.showInformationMessage(`Pull request #${this.pullRequest.id} merged.`);
-    if (failures.length > 0) {
-      void vscode.window.showWarningMessage(
-        `The pull request was merged, but these Jira transitions failed: ${failures.join(" · ")}`,
-      );
+    private async merge(
+        strategy: MergeStrategy,
+        closeSourceBranch: boolean,
+        commitMessage: string,
+        transitions: {issueKey: string; transitionId: string}[],
+    ): Promise<void> {
+        if (!commitMessage.trim() || commitMessage.length > 10_000) {
+            throw new Error("The commit message must contain 1–10,000 characters.");
+        }
+        if (
+            new Set(transitions.map(({issueKey}) => issueKey)).size !== transitions.length
+        ) {
+            throw new Error("Select at most one transition per Jira issue.");
+        }
+        for (const transition of transitions) {
+            if (
+                !this.availableTransitions
+                    .get(transition.issueKey)
+                    ?.has(transition.transitionId)
+            ) {
+                throw new Error(
+                    `The selected Jira transition for ${transition.issueKey} is not available.`,
+                );
+            }
+        }
+
+        const jira = this.getJiraClient();
+        if (transitions.length > 0 && !jira) {
+            throw new Error("Connect to Jira before applying issue transitions.");
+        }
+
+        await this.client.merge(
+            this.repository,
+            this.pullRequest.id,
+            strategy,
+            closeSourceBranch,
+            commitMessage.trim(),
+        );
+        this.onMerged();
+        const results = await Promise.allSettled(
+            transitions.map(({issueKey, transitionId}) =>
+                jira!.transition(issueKey, transitionId),
+            ),
+        );
+        const failures = results.flatMap((result, index) =>
+            result.status === "rejected"
+                ? [`${transitions[index].issueKey}: ${errorMessage(result.reason)}`]
+                : [],
+        );
+        void vscode.window.showInformationMessage(
+            `Pull request #${this.pullRequest.id} merged.`,
+        );
+        if (failures.length > 0) {
+            void vscode.window.showWarningMessage(
+                `The pull request was merged, but these Jira transitions failed: ${failures.join(" · ")}`,
+            );
+        }
+        await this.panel.webview.postMessage({command: "mergeComplete"});
     }
-    await this.panel.webview.postMessage({ command: "mergeComplete" });
-  }
 
-  private render(comments: PullRequestComment[]): string {
-    const nonce = Array.from({ length: 32 }, () => Math.random().toString(36)[2]).join("");
-    const approved = this.reviewState === "approved";
-    const changesRequested = this.reviewState === "changes_requested";
-    const description = renderMarkdown(this.pullRequest.description ?? "");
-    const state = this.pullRequest.draft
-      ? "Draft"
-      : this.pullRequest.state.charAt(0) + this.pullRequest.state.slice(1).toLowerCase();
-    const statusClass = this.pullRequest.draft
-      ? "status--draft"
-      : `status--${this.pullRequest.state.toLowerCase()}`;
-    const defaultCommitMessage =
-      `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
-    const renderedComments = comments.map((comment) => {
-      const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
-      const content = comment.content?.raw
-        ? renderMarkdown(rawMarkdown)
-        : sanitizeCommentHtml(rawMarkdown);
-      const parentId = comment.parent?.id;
-      const replyControl = parentId === undefined
-        ? `<button class="secondary reply" data-parent="${comment.id}">Reply</button>`
-        : "";
-      const deleteControl =
-        `<button class="secondary delete-comment" data-comment-id="${comment.id}" aria-label="Delete comment">Delete</button>`;
-      return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
-    }).join("");
+    private render(comments: PullRequestComment[]): string {
+        const nonce = Array.from({length: 32}, () => Math.random().toString(36)[2]).join(
+            "",
+        );
+        const approved = this.reviewState === "approved";
+        const changesRequested = this.reviewState === "changes_requested";
+        const description = renderMarkdown(this.pullRequest.description ?? "");
+        const state = this.pullRequest.draft
+            ? "Draft"
+            : this.pullRequest.state.charAt(0) +
+              this.pullRequest.state.slice(1).toLowerCase();
+        const statusClass = this.pullRequest.draft
+            ? "status--draft"
+            : `status--${this.pullRequest.state.toLowerCase()}`;
+        const defaultCommitMessage = `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
+        const renderedComments = comments
+            .map((comment) => {
+                const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
+                const content = comment.content?.raw
+                    ? renderMarkdown(rawMarkdown)
+                    : sanitizeCommentHtml(rawMarkdown);
+                const parentId = comment.parent?.id;
+                const replyControl =
+                    parentId === undefined
+                        ? `<button class="secondary reply" data-parent="${comment.id}">Reply</button>`
+                        : "";
+                const deleteControl = `<button class="secondary delete-comment" data-comment-id="${comment.id}" aria-label="Delete comment">Delete</button>`;
+                return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
+            })
+            .join("");
 
-    return `<!DOCTYPE html>
+        return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1230,283 +1322,354 @@ export class PullRequestWebview {
   </script>
 </body>
 </html>`;
-  }
+    }
 }
 
 type WebviewMessage =
-  | { command: "deleteComment"; commentId: number }
-  | { command: "comment"; markdown: string }
-  | { command: "reply"; markdown: string; parentId: number }
-  | { command: "approve" }
-  | { command: "requestChanges" }
-  | { command: "loadMergeOptions" }
-  | { command: "connectJira" }
-  | {
-      command: "improveComment";
-      requestId: number;
-      markdown: string;
-      action: ImproveOptions["action"];
-      tone?: ImproveOptions["tone"];
-      targetLanguage?: string;
-      parentId?: number;
-    }
-  | { command: "cancelImprove" }
-  | { command: "configureAi" }
-  | { command: "aiReview"; action: "run" | "cancel" | "clear" | "editRules" | "postSummary" }
-  | { command: "aiReviewFindings"; action: "open" | "dismiss" | "restore" | "post"; ids: string[] }
-  | {
-      command: "merge";
-      strategy: MergeStrategy;
-      closeSourceBranch: boolean;
-      commitMessage: string;
-      transitions: { issueKey: string; transitionId: string }[];
-    };
+    | {command: "deleteComment"; commentId: number}
+    | {command: "comment"; markdown: string}
+    | {command: "reply"; markdown: string; parentId: number}
+    | {command: "approve"}
+    | {command: "requestChanges"}
+    | {command: "loadMergeOptions"}
+    | {command: "connectJira"}
+    | {
+          command: "improveComment";
+          requestId: number;
+          markdown: string;
+          action: ImproveOptions["action"];
+          tone?: ImproveOptions["tone"];
+          targetLanguage?: string;
+          parentId?: number;
+      }
+    | {command: "cancelImprove"}
+    | {command: "configureAi"}
+    | {
+          command: "aiReview";
+          action: "run" | "cancel" | "clear" | "editRules" | "postSummary";
+      }
+    | {
+          command: "aiReviewFindings";
+          action: "open" | "dismiss" | "restore" | "post";
+          ids: string[];
+      }
+    | {
+          command: "merge";
+          strategy: MergeStrategy;
+          closeSourceBranch: boolean;
+          commitMessage: string;
+          transitions: {issueKey: string; transitionId: string}[];
+      };
 
 function isWebviewMessage(message: unknown): message is WebviewMessage {
-  if (!message || typeof message !== "object" || !("command" in message)) {
+    if (!message || typeof message !== "object" || !("command" in message)) {
+        return false;
+    }
+    const candidate = message as Record<string, unknown>;
+    if (candidate.command === "deleteComment") {
+        return (
+            Number.isSafeInteger(candidate.commentId) && Number(candidate.commentId) > 0
+        );
+    }
+    if (
+        candidate.command === "approve" ||
+        candidate.command === "requestChanges" ||
+        candidate.command === "loadMergeOptions" ||
+        candidate.command === "connectJira" ||
+        candidate.command === "cancelImprove" ||
+        candidate.command === "configureAi"
+    ) {
+        return true;
+    }
+    if (candidate.command === "aiReview") {
+        return ["run", "cancel", "clear", "editRules", "postSummary"].includes(
+            candidate.action as string,
+        );
+    }
+    if (candidate.command === "aiReviewFindings") {
+        return (
+            ["open", "dismiss", "restore", "post"].includes(candidate.action as string) &&
+            Array.isArray(candidate.ids) &&
+            candidate.ids.length > 0 &&
+            candidate.ids.length <= 500 &&
+            candidate.ids.every(
+                (id) => typeof id === "string" && /^[\w-]{1,64}$/.test(id),
+            )
+        );
+    }
+    if (candidate.command === "improveComment") {
+        return (
+            Number.isInteger(candidate.requestId) &&
+            typeof candidate.markdown === "string" &&
+            candidate.markdown.trim().length > 0 &&
+            candidate.markdown.length <= 10_000 &&
+            isImproveAction(candidate.action) &&
+            (candidate.tone === undefined || isImproveTone(candidate.tone)) &&
+            (candidate.targetLanguage === undefined ||
+                (typeof candidate.targetLanguage === "string" &&
+                    candidate.targetLanguage.length <= 60)) &&
+            (candidate.parentId === undefined ||
+                (Number.isInteger(candidate.parentId) && Number(candidate.parentId) > 0))
+        );
+    }
+    if (candidate.command === "merge") {
+        return (
+            (candidate.strategy === "merge_commit" ||
+                candidate.strategy === "squash" ||
+                candidate.strategy === "fast_forward") &&
+            typeof candidate.closeSourceBranch === "boolean" &&
+            typeof candidate.commitMessage === "string" &&
+            Array.isArray(candidate.transitions) &&
+            candidate.transitions.every(
+                (item) =>
+                    Boolean(item) &&
+                    typeof item === "object" &&
+                    typeof item.issueKey === "string" &&
+                    /^[A-Z][A-Z0-9_]*-\d+$/.test(item.issueKey) &&
+                    typeof item.transitionId === "string" &&
+                    /^\d+$/.test(item.transitionId),
+            )
+        );
+    }
+    if (candidate.command === "comment") {
+        return typeof candidate.markdown === "string";
+    }
+    if (candidate.command === "reply") {
+        return (
+            typeof candidate.markdown === "string" &&
+            Number.isInteger(candidate.parentId) &&
+            Number(candidate.parentId) > 0
+        );
+    }
     return false;
-  }
-  const candidate = message as Record<string, unknown>;
-  if (candidate.command === "deleteComment") {
-    return Number.isSafeInteger(candidate.commentId) && Number(candidate.commentId) > 0;
-  }
-  if (
-    candidate.command === "approve" ||
-    candidate.command === "requestChanges" ||
-    candidate.command === "loadMergeOptions" ||
-    candidate.command === "connectJira" ||
-    candidate.command === "cancelImprove" ||
-    candidate.command === "configureAi"
-  ) {
-    return true;
-  }
-  if (candidate.command === "aiReview") {
-    return ["run", "cancel", "clear", "editRules", "postSummary"].includes(candidate.action as string);
-  }
-  if (candidate.command === "aiReviewFindings") {
-    return (
-      ["open", "dismiss", "restore", "post"].includes(candidate.action as string) &&
-      Array.isArray(candidate.ids) &&
-      candidate.ids.length > 0 &&
-      candidate.ids.length <= 500 &&
-      candidate.ids.every((id) => typeof id === "string" && /^[\w-]{1,64}$/.test(id))
-    );
-  }
-  if (candidate.command === "improveComment") {
-    return (
-      Number.isInteger(candidate.requestId) &&
-      typeof candidate.markdown === "string" &&
-      candidate.markdown.trim().length > 0 &&
-      candidate.markdown.length <= 10_000 &&
-      isImproveAction(candidate.action) &&
-      (candidate.tone === undefined || isImproveTone(candidate.tone)) &&
-      (candidate.targetLanguage === undefined ||
-        (typeof candidate.targetLanguage === "string" && candidate.targetLanguage.length <= 60)) &&
-      (candidate.parentId === undefined || (Number.isInteger(candidate.parentId) && Number(candidate.parentId) > 0))
-    );
-  }
-  if (candidate.command === "merge") {
-    return (
-      (candidate.strategy === "merge_commit" || candidate.strategy === "squash" || candidate.strategy === "fast_forward") &&
-      typeof candidate.closeSourceBranch === "boolean" &&
-      typeof candidate.commitMessage === "string" &&
-      Array.isArray(candidate.transitions) &&
-      candidate.transitions.every((item) =>
-        Boolean(item) &&
-        typeof item === "object" &&
-        typeof item.issueKey === "string" &&
-        /^[A-Z][A-Z0-9_]*-\d+$/.test(item.issueKey) &&
-        typeof item.transitionId === "string" &&
-        /^\d+$/.test(item.transitionId),
-      )
-    );
-  }
-  if (candidate.command === "comment") {
-    return typeof candidate.markdown === "string";
-  }
-  if (candidate.command === "reply") {
-    return (
-      typeof candidate.markdown === "string" &&
-      Number.isInteger(candidate.parentId) &&
-      Number(candidate.parentId) > 0
-    );
-  }
-  return false;
 }
 
 const ICON_PATHS: Record<string, string> = {
-  wand: '<path d="M2.5 13.5 10 6"/><path d="m9 5 2 2"/><path d="M12.5 1.5v3M11 3h3"/><path d="M5 1.5v2M4 2.5h2"/><path d="M13 9v2M12 10h2"/>',
-  chevronDown: '<path d="m3.5 6 4.5 4.5L12.5 6"/>',
-  chevronRight: '<path d="m6 3.5 4.5 4.5L6 12.5"/>',
-  "list-flat": '<path d="M6 4h8M6 8h8M6 12h8"/><path d="M2.5 4h.01M2.5 8h.01M2.5 12h.01" stroke-width="2"/>',
-  "whole-word": '<path d="m1.5 13 3.25-9L8 13M2.6 10h4.3"/><path d="m9.5 10.5 2 2 3.5-4.5"/>',
-  sync: '<path d="M1.5 4.5h3l6 7h4M1.5 11.5h3l1.8-2.1M9.7 6.6l1.8-2.1h3"/><path d="m12.5 2.5 2 2-2 2M12.5 9.5l2 2-2 2"/>',
-  comment: '<path d="M2 2.5h12v8.5H7l-3.5 3v-3H2z"/>',
-  "fold-up": '<path d="M2 5h12M2 8.5h8"/><path d="m11.5 12.5 1.5-1.5 1.5 1.5"/>',
-  "fold-down": '<path d="M2 3.5h12M2 6.5h12M2 9.5h12M2 12.5h7"/>',
-  code: '<path d="M5 4 1.5 8 5 12M11 4l3.5 4-3.5 4"/>',
-  globe: '<path d="M1.5 3h7M5 1.5V3M3 3c.5 2.6 2.4 4.6 4.8 5.6M7 3c-.6 2.6-2.5 4.6-5 5.6"/><path d="m8.5 14.5 3-7.5 3 7.5M9.5 12h4"/>',
-  gear: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/>',
+    wand: '<path d="M2.5 13.5 10 6"/><path d="m9 5 2 2"/><path d="M12.5 1.5v3M11 3h3"/><path d="M5 1.5v2M4 2.5h2"/><path d="M13 9v2M12 10h2"/>',
+    chevronDown: '<path d="m3.5 6 4.5 4.5L12.5 6"/>',
+    chevronRight: '<path d="m6 3.5 4.5 4.5L6 12.5"/>',
+    "list-flat":
+        '<path d="M6 4h8M6 8h8M6 12h8"/><path d="M2.5 4h.01M2.5 8h.01M2.5 12h.01" stroke-width="2"/>',
+    "whole-word":
+        '<path d="m1.5 13 3.25-9L8 13M2.6 10h4.3"/><path d="m9.5 10.5 2 2 3.5-4.5"/>',
+    sync: '<path d="M1.5 4.5h3l6 7h4M1.5 11.5h3l1.8-2.1M9.7 6.6l1.8-2.1h3"/><path d="m12.5 2.5 2 2-2 2M12.5 9.5l2 2-2 2"/>',
+    comment: '<path d="M2 2.5h12v8.5H7l-3.5 3v-3H2z"/>',
+    "fold-up": '<path d="M2 5h12M2 8.5h8"/><path d="m11.5 12.5 1.5-1.5 1.5 1.5"/>',
+    "fold-down": '<path d="M2 3.5h12M2 6.5h12M2 9.5h12M2 12.5h7"/>',
+    code: '<path d="M5 4 1.5 8 5 12M11 4l3.5 4-3.5 4"/>',
+    globe: '<path d="M1.5 3h7M5 1.5V3M3 3c.5 2.6 2.4 4.6 4.8 5.6M7 3c-.6 2.6-2.5 4.6-5 5.6"/><path d="m8.5 14.5 3-7.5 3 7.5M9.5 12h4"/>',
+    gear: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/>',
 };
 
 function icon(name: string): string {
-  return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] ?? ""}</svg>`;
+    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] ?? ""}</svg>`;
 }
 
 const AI_LOGO_SVG = `<svg viewBox="0 0 16 16" aria-hidden="true"><defs><linearGradient id="ai-logo-gradient" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset=".5" stop-color="#a855f7"/><stop offset="1" stop-color="#f97316"/></linearGradient></defs><path fill="url(#ai-logo-gradient)" d="M8 .8c.5 3.6 2.1 5.4 6.2 6.2v2c-4.1.8-5.7 2.6-6.2 6.2h-.1C7.4 11.6 5.8 9.8 1.8 9V7c4-.8 5.6-2.6 6.1-6.2z"/></svg>`;
 
 function renderAiMenu(providerLabel: string): string {
-  const item = (attributes: string, label: string, iconName?: string, description?: string): string =>
-    `<button type="button" class="ai-menu-item" role="menuitem" ${attributes}${description ? ` title="${escapeHtml(description)}"` : ""}>${iconName ? icon(iconName) : ""}<span>${escapeHtml(label)}</span></button>`;
-  const entries = IMPROVE_ACTIONS.map((action) => {
-    if (action.submenu === "tone") {
-      const tones = IMPROVE_TONES.map((tone) =>
-        `<button type="button" class="ai-menu-item" role="menuitem" data-action="tone" data-tone="${tone.id}" data-label="${escapeHtml(describeImproveOptions({ action: "tone", tone: tone.id }))}"><span>${escapeHtml(tone.label)}<small>${escapeHtml(tone.description)}</small></span></button>`,
-      ).join("");
-      return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${tones}</div></div>`;
-    }
-    if (action.submenu === "translate") {
-      const languages = TRANSLATE_LANGUAGES.map((language) =>
-        item(
-          `data-action="translate" data-language="${escapeHtml(language)}" data-label="${escapeHtml(describeImproveOptions({ action: "translate", targetLanguage: language }))}"`,
-          language,
-        ),
-      ).join("");
-      const other = `<div class="ai-other"><input id="ai-other-language" type="text" maxlength="60" placeholder="Other language…" aria-label="Other language"><button type="button" id="ai-other-submit" class="secondary" aria-label="Translate to the typed language">→</button></div>`;
-      return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${languages}${other}</div></div>`;
-    }
-    return item(
-      `data-action="${action.id}" data-label="${escapeHtml(describeImproveOptions({ action: action.id }))}"`,
-      action.label,
-      action.icon,
-      action.description,
-    );
-  }).join("");
-  const footer = `<button type="button" class="ai-menu-item ai-menu-footer" role="menuitem" data-configure>${icon("gear")}<span>AI provider: <span id="ai-provider-name">${escapeHtml(providerLabel)}</span> · Change…</span></button>`;
-  return `<div id="ai-menu" class="ai-menu" role="menu" aria-label="AI actions" hidden>${entries}<div class="ai-menu-separator" role="separator"></div>${footer}</div>`;
+    const item = (
+        attributes: string,
+        label: string,
+        iconName?: string,
+        description?: string,
+    ): string =>
+        `<button type="button" class="ai-menu-item" role="menuitem" ${attributes}${description ? ` title="${escapeHtml(description)}"` : ""}>${iconName ? icon(iconName) : ""}<span>${escapeHtml(label)}</span></button>`;
+    const entries = IMPROVE_ACTIONS.map((action) => {
+        if (action.submenu === "tone") {
+            const tones = IMPROVE_TONES.map(
+                (tone) =>
+                    `<button type="button" class="ai-menu-item" role="menuitem" data-action="tone" data-tone="${tone.id}" data-label="${escapeHtml(describeImproveOptions({action: "tone", tone: tone.id}))}"><span>${escapeHtml(tone.label)}<small>${escapeHtml(tone.description)}</small></span></button>`,
+            ).join("");
+            return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${tones}</div></div>`;
+        }
+        if (action.submenu === "translate") {
+            const languages = TRANSLATE_LANGUAGES.map((language) =>
+                item(
+                    `data-action="translate" data-language="${escapeHtml(language)}" data-label="${escapeHtml(describeImproveOptions({action: "translate", targetLanguage: language}))}"`,
+                    language,
+                ),
+            ).join("");
+            const other = `<div class="ai-other"><input id="ai-other-language" type="text" maxlength="60" placeholder="Other language…" aria-label="Other language"><button type="button" id="ai-other-submit" class="secondary" aria-label="Translate to the typed language">→</button></div>`;
+            return `<div class="ai-menu-item-wrap"><button type="button" class="ai-menu-item" role="menuitem" aria-haspopup="menu" aria-expanded="false" data-submenu-toggle>${icon(action.icon)}<span>${escapeHtml(action.label)}</span>${icon("chevronRight")}</button><div class="ai-menu ai-submenu" role="menu" aria-label="${escapeHtml(action.label)}" hidden>${languages}${other}</div></div>`;
+        }
+        return item(
+            `data-action="${action.id}" data-label="${escapeHtml(describeImproveOptions({action: action.id}))}"`,
+            action.label,
+            action.icon,
+            action.description,
+        );
+    }).join("");
+    const footer = `<button type="button" class="ai-menu-item ai-menu-footer" role="menuitem" data-configure>${icon("gear")}<span>AI provider: <span id="ai-provider-name">${escapeHtml(providerLabel)}</span> · Change…</span></button>`;
+    return `<div id="ai-menu" class="ai-menu" role="menu" aria-label="AI actions" hidden>${entries}<div class="ai-menu-separator" role="separator"></div>${footer}</div>`;
 }
 
-function renderAiReviewSection(state: AiReviewState, currentSourceCommit: string | undefined): string {
-  const result = state.result;
-  const button = (action: string, label: string, secondary = true, extra = ""): string =>
-    `<button type="button" class="${secondary ? "secondary" : ""}" data-ai-action="${action}"${extra}>${escapeHtml(label)}</button>`;
-  const headerActions = state.running
-    ? button("cancel", "Stop")
-    : `${button("run", result ? "Review again" : "Review with AI", Boolean(result))}${button("editRules", "Edit rules…")}`;
-  const parts = [
-    `<div class="section-title"><h2 class="ai-review-title">${AI_LOGO_SVG}AI review</h2><div class="actions">${headerActions}</div></div>`,
-  ];
-  if (state.running) {
-    parts.push(`<div class="ai-review-progress" role="status"><span>${escapeHtml(state.progress ?? "Reviewing…")}</span><div class="shimmer"></div></div>`);
-  }
-  if (state.error) {
-    parts.push(`<p class="ai-error" role="alert">${escapeHtml(state.error)}</p>`);
-  }
-  if (!result) {
-    if (!state.running) {
-      parts.push(
-        '<p class="empty-state">Let the AI go through every change in this pull request and point out bugs, risks and rule violations — or confirm that everything looks good. Nothing is posted until you choose to.</p>',
-        '<p class="ai-review-hint">Tip: use <strong>Edit rules…</strong> to tell the AI what your team cares about (Markdown files with optional <code>applyTo</code> globs). Repository instructions such as <code>AGENTS.md</code>, <code>.github/copilot-instructions.md</code> and <code>.github/instructions/*.instructions.md</code> are used too.</p>',
-      );
+function renderAiReviewSection(
+    state: AiReviewState,
+    currentSourceCommit: string | undefined,
+): string {
+    const result = state.result;
+    const button = (
+        action: string,
+        label: string,
+        secondary = true,
+        extra = "",
+    ): string =>
+        `<button type="button" class="${secondary ? "secondary" : ""}" data-ai-action="${action}"${extra}>${escapeHtml(label)}</button>`;
+    const headerActions = state.running
+        ? button("cancel", "Stop")
+        : `${button("run", result ? "Review again" : "Review with AI", Boolean(result))}${button("editRules", "Edit rules…")}`;
+    const parts = [
+        `<div class="section-title"><h2 class="ai-review-title">${AI_LOGO_SVG}AI review</h2><div class="actions">${headerActions}</div></div>`,
+    ];
+    if (state.running) {
+        parts.push(
+            `<div class="ai-review-progress" role="status"><span>${escapeHtml(state.progress ?? "Reviewing…")}</span><div class="shimmer"></div></div>`,
+        );
     }
+    if (state.error) {
+        parts.push(`<p class="ai-error" role="alert">${escapeHtml(state.error)}</p>`);
+    }
+    if (!result) {
+        if (!state.running) {
+            parts.push(
+                '<p class="empty-state">Let the AI go through every change in this pull request and point out bugs, risks and rule violations — or confirm that everything looks good. Nothing is posted until you choose to.</p>',
+                '<p class="ai-review-hint">Tip: use <strong>Edit rules…</strong> to tell the AI what your team cares about (Markdown files with optional <code>applyTo</code> globs). Repository instructions such as <code>AGENTS.md</code>, <code>.github/copilot-instructions.md</code> and <code>.github/instructions/*.instructions.md</code> are used too.</p>',
+            );
+        }
+        return parts.join("");
+    }
+
+    const meta = [
+        escapeHtml(result.provider),
+        escapeHtml(formatDate(result.createdAt)),
+        `${result.filesReviewed.length} ${result.filesReviewed.length === 1 ? "file" : "files"} reviewed`,
+        ...(result.filesSkipped.length > 0
+            ? [`${result.filesSkipped.length} skipped`]
+            : []),
+    ];
+    parts.push(`<p class="ai-review-meta">${meta.join(" · ")}</p>`);
+    if (
+        currentSourceCommit &&
+        result.sourceCommit &&
+        currentSourceCommit !== result.sourceCommit
+    ) {
+        parts.push(
+            '<p class="ai-stale">New commits were pushed after this review. Run it again to review the latest changes.</p>',
+        );
+    }
+    parts.push(
+        `<span class="verdict verdict--${result.verdict}">${escapeHtml(VERDICT_LABELS[result.verdict])}</span>`,
+    );
+    if (result.summary) {
+        parts.push(
+            `<div class="markdown ai-review-summary">${renderMarkdown(result.summary)}</div>`,
+        );
+    }
+
+    for (const severity of REVIEW_SEVERITIES) {
+        const findings = result.findings.filter(
+            (finding) => finding.severity === severity,
+        );
+        if (findings.length > 0) {
+            parts.push(
+                `<h3 class="finding-group">${escapeHtml(SEVERITY_LABELS[severity])} (${findings.length})</h3>`,
+                ...findings.map(renderFinding),
+            );
+        }
+    }
+
+    const actions: string[] = [];
+    if (result.findings.some((finding) => finding.status === "open")) {
+        actions.push(button("postSelected", "Post selected", false));
+    }
+    actions.push(button("postSummary", "Post summary as comment"));
+    if (result.verdict === "approve") {
+        actions.push(button("approve", "✅ Approve"));
+    } else if (result.verdict === "request_changes") {
+        actions.push(button("requestChanges", "⊖ Request changes"));
+    }
+    actions.push(button("clear", "Clear review"));
+    parts.push(
+        `<div class="ai-review-actions">${actions.join("")}<span class="ai-disclaimer">AI-generated review may be inaccurate. Check before posting.</span></div>`,
+    );
+
+    const details: string[] = [];
+    if (result.rules.length > 0) {
+        details.push(
+            `<details class="ai-review-details"><summary>Review rules applied (${result.rules.length})</summary><ul>${result.rules
+                .map(
+                    (rule) =>
+                        `<li><code>${escapeHtml(rule.source)}</code>${rule.description ? ` — ${escapeHtml(rule.description)}` : ""}${rule.truncated ? " (truncated)" : ""}</li>`,
+                )
+                .join("")}</ul></details>`,
+        );
+    } else {
+        details.push(
+            '<p class="ai-review-details">No review rules were applied. Use <strong>Edit rules…</strong> to add your team\'s guidelines.</p>',
+        );
+    }
+    if (result.filesSkipped.length > 0) {
+        details.push(
+            `<details class="ai-review-details"><summary>Files not reviewed (${result.filesSkipped.length})</summary><ul>${result.filesSkipped.map((file) => `<li><code>${escapeHtml(file)}</code></li>`).join("")}</ul></details>`,
+        );
+    }
+    parts.push(...details);
     return parts.join("");
-  }
-
-  const meta = [
-    escapeHtml(result.provider),
-    escapeHtml(formatDate(result.createdAt)),
-    `${result.filesReviewed.length} ${result.filesReviewed.length === 1 ? "file" : "files"} reviewed`,
-    ...(result.filesSkipped.length > 0 ? [`${result.filesSkipped.length} skipped`] : []),
-  ];
-  parts.push(`<p class="ai-review-meta">${meta.join(" · ")}</p>`);
-  if (currentSourceCommit && result.sourceCommit && currentSourceCommit !== result.sourceCommit) {
-    parts.push('<p class="ai-stale">New commits were pushed after this review. Run it again to review the latest changes.</p>');
-  }
-  parts.push(`<span class="verdict verdict--${result.verdict}">${escapeHtml(VERDICT_LABELS[result.verdict])}</span>`);
-  if (result.summary) {
-    parts.push(`<div class="markdown ai-review-summary">${renderMarkdown(result.summary)}</div>`);
-  }
-
-  for (const severity of REVIEW_SEVERITIES) {
-    const findings = result.findings.filter((finding) => finding.severity === severity);
-    if (findings.length > 0) {
-      parts.push(`<h3 class="finding-group">${escapeHtml(SEVERITY_LABELS[severity])} (${findings.length})</h3>`, ...findings.map(renderFinding));
-    }
-  }
-
-  const actions: string[] = [];
-  if (result.findings.some((finding) => finding.status === "open")) {
-    actions.push(button("postSelected", "Post selected", false));
-  }
-  actions.push(button("postSummary", "Post summary as comment"));
-  if (result.verdict === "approve") {
-    actions.push(button("approve", "✅ Approve"));
-  } else if (result.verdict === "request_changes") {
-    actions.push(button("requestChanges", "⊖ Request changes"));
-  }
-  actions.push(button("clear", "Clear review"));
-  parts.push(`<div class="ai-review-actions">${actions.join("")}<span class="ai-disclaimer">AI-generated review may be inaccurate. Check before posting.</span></div>`);
-
-  const details: string[] = [];
-  if (result.rules.length > 0) {
-    details.push(`<details class="ai-review-details"><summary>Review rules applied (${result.rules.length})</summary><ul>${result.rules.map((rule) =>
-      `<li><code>${escapeHtml(rule.source)}</code>${rule.description ? ` — ${escapeHtml(rule.description)}` : ""}${rule.truncated ? " (truncated)" : ""}</li>`,
-    ).join("")}</ul></details>`);
-  } else {
-    details.push('<p class="ai-review-details">No review rules were applied. Use <strong>Edit rules…</strong> to add your team\'s guidelines.</p>');
-  }
-  if (result.filesSkipped.length > 0) {
-    details.push(`<details class="ai-review-details"><summary>Files not reviewed (${result.filesSkipped.length})</summary><ul>${result.filesSkipped.map((file) => `<li><code>${escapeHtml(file)}</code></li>`).join("")}</ul></details>`);
-  }
-  parts.push(...details);
-  return parts.join("");
 }
 
 function renderFinding(finding: AiReviewFinding): string {
-  const id = escapeHtml(finding.id);
-  const location = `${finding.file}${finding.line ? `:${finding.line}` : ""}`;
-  const selectable = finding.status === "open";
-  const checkbox = selectable
-    ? `<input type="checkbox" class="finding-select" value="${id}" checked aria-label="Select finding">`
-    : "";
-  const statusTag = finding.status === "open" ? "" : `<span class="finding-tag">${finding.status === "posted" ? "Posted" : "Dismissed"}</span>`;
-  const actions = finding.status === "open"
-    ? `<button type="button" data-ai-action="post" data-id="${id}">Post comment</button><button type="button" class="secondary" data-ai-action="dismiss" data-id="${id}">Dismiss</button>`
-    : finding.status === "dismissed"
-      ? `<button type="button" class="secondary" data-ai-action="restore" data-id="${id}">Restore</button>`
-      : "";
-  const suggestion = finding.suggestion
-    ? `<pre><code>${escapeHtml(finding.suggestion)}</code></pre>`
-    : "";
-  const body = finding.body && finding.body !== finding.title ? renderMarkdown(finding.body) : "";
-  return `<article class="finding finding--${finding.severity}" data-status="${finding.status}"><header><label>${checkbox}<strong>${escapeHtml(finding.title)}</strong></label><span class="finding-tags"><span class="finding-tag">${escapeHtml(categoryLabel(finding))}</span>${statusTag}</span></header><div class="finding-location"><button type="button" class="link-button" data-ai-action="open" data-id="${id}" title="Open in diff">${escapeHtml(location)}</button></div><div class="markdown">${body}${suggestion}</div><div class="actions">${actions}</div></article>`;
+    const id = escapeHtml(finding.id);
+    const location = `${finding.file}${finding.line ? `:${finding.line}` : ""}`;
+    const selectable = finding.status === "open";
+    const checkbox = selectable
+        ? `<input type="checkbox" class="finding-select" value="${id}" checked aria-label="Select finding">`
+        : "";
+    const statusTag =
+        finding.status === "open"
+            ? ""
+            : `<span class="finding-tag">${finding.status === "posted" ? "Posted" : "Dismissed"}</span>`;
+    const actions =
+        finding.status === "open"
+            ? `<button type="button" data-ai-action="post" data-id="${id}">Post comment</button><button type="button" class="secondary" data-ai-action="dismiss" data-id="${id}">Dismiss</button>`
+            : finding.status === "dismissed"
+              ? `<button type="button" class="secondary" data-ai-action="restore" data-id="${id}">Restore</button>`
+              : "";
+    const suggestion = finding.suggestion
+        ? `<pre><code>${escapeHtml(finding.suggestion)}</code></pre>`
+        : "";
+    const body =
+        finding.body && finding.body !== finding.title
+            ? renderMarkdown(finding.body)
+            : "";
+    return `<article class="finding finding--${finding.severity}" data-status="${finding.status}"><header><label>${checkbox}<strong>${escapeHtml(finding.title)}</strong></label><span class="finding-tags"><span class="finding-tag">${escapeHtml(categoryLabel(finding))}</span>${statusTag}</span></header><div class="finding-location"><button type="button" class="link-button" data-ai-action="open" data-id="${id}" title="Open in diff">${escapeHtml(location)}</button></div><div class="markdown">${body}${suggestion}</div><div class="actions">${actions}</div></article>`;
 }
 
 function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => {
-    switch (character) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      default:
-        return "&#39;";
-    }
-  });
+    return value.replace(/[&<>"']/g, (character) => {
+        switch (character) {
+            case "&":
+                return "&amp;";
+            case "<":
+                return "&lt;";
+            case ">":
+                return "&gt;";
+            case '"':
+                return "&quot;";
+            default:
+                return "&#39;";
+        }
+    });
 }
 
 function formatDate(value?: string): string {
-  if (!value) {
-    return "";
-  }
-  const timestamp = Date.parse(value);
-  return Number.isNaN(timestamp) ? value : new Date(timestamp).toLocaleString();
+    if (!value) {
+        return "";
+    }
+    const timestamp = Date.parse(value);
+    return Number.isNaN(timestamp) ? value : new Date(timestamp).toLocaleString();
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+    return error instanceof Error ? error.message : String(error);
 }
