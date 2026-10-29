@@ -520,6 +520,27 @@ test("removes approvals and change requests with DELETE", async () => {
   assert.equal(fake.calls[1].method, "DELETE");
 });
 
+test("shares the cached current account identity across diff comments and review state", async () => {
+  const fake = fakeTransport([
+    { statusCode: 200, body: JSON.stringify({ account_id: "me" }) },
+    { statusCode: 200, body: JSON.stringify({ participants: [{ user: { account_id: "me" }, approved: true }] }) },
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+  assert.deepEqual(await Promise.all([client.getCurrentAccountId(), client.getCurrentAccountId()]), ["me", "me"]);
+  assert.equal(await client.getMyReviewState(repository, 42), "approved");
+  assert.equal(fake.calls.filter((call) => new URL(call.url).pathname === "/2.0/user").length, 1);
+});
+
+test("reports identity lookup errors and retries after a failed request", async () => {
+  const fake = fakeTransport([
+    { statusCode: 500, body: JSON.stringify({ error: { message: "Unavailable" } }) },
+    { statusCode: 200, body: JSON.stringify({ account_id: "me" }) },
+  ]);
+  const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+  await assert.rejects(client.getCurrentAccountId(), /HTTP 500: Unavailable/);
+  assert.equal(await client.getCurrentAccountId(), "me");
+});
+
 test("reads the current user's review state from the PR participants", async () => {
   const pullRequest = (state, approved = false) => ({
     statusCode: 200,

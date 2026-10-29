@@ -10,10 +10,12 @@ import {
 } from "../bitbucket/types";
 
 type TreeNode = PullRequestNode | PathNode;
+export type FileLayout = "tree" | "list";
 
 export interface PullRequestAuthor {
   accountId: string;
   displayName: string;
+  avatarUrl?: string;
 }
 
 export class PullRequestNode extends vscode.TreeItem {
@@ -38,6 +40,7 @@ class PathNode extends vscode.TreeItem {
     readonly files: Map<string, ChangedFile>,
     readonly sourceBranch: string,
     readonly sourceRepositoryFullName?: string,
+    showPath = false,
   ) {
     super(
       fileNode.name,
@@ -54,6 +57,9 @@ class PathNode extends vscode.TreeItem {
     this.iconPath = fileNode.kind === "directory" ? vscode.ThemeIcon.Folder : vscode.ThemeIcon.File;
     this.contextValue = fileNode.kind === "directory" ? "bitbucketChangedFolder" : "bitbucketChangedFile";
     if (fileNode.kind === "file") {
+      if (showPath && fileNode.path.includes("/")) {
+        this.description = `- ${fileNode.path.slice(0, fileNode.path.lastIndexOf("/"))}`;
+      }
       this.command = {
         command: "bitbucketPrReviewer.openChangedFile",
         title: "Open File Changes",
@@ -77,6 +83,7 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
   private sort: PullRequestSort = "-updated_on";
   private author: PullRequestAuthor | undefined;
   private loadedPullRequests: PullRequest[] = [];
+  private fileLayout: FileLayout = "tree";
 
   constructor(
     private readonly getClient: () => BitbucketClient,
@@ -108,14 +115,20 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
         }
         const files = await this.getClient().getChangedFiles(repository, element.pullRequest.id);
         const fileTree = buildFileTree(files.map((file) => file.path));
+        const flattenFiles = (nodes: FileTreeNode[]): FileTreeNode[] =>
+          nodes.flatMap((node) => node.kind === "file" ? [node] : flattenFiles(node.children));
+        const nodes = this.fileLayout === "list"
+          ? flattenFiles(fileTree).sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path))
+          : fileTree;
         const filesByPath = new Map(files.map((file) => [file.path, file]));
-        return fileTree.map((node) => new PathNode(
+        return nodes.map((node) => new PathNode(
           node,
           repository,
           element.pullRequest.id,
           filesByPath,
           element.pullRequest.source.branch.name,
           element.pullRequest.source.repository?.full_name,
+          this.fileLayout === "list",
         ));
       }
 
@@ -155,6 +168,7 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
         authors.set(accountId, {
           accountId,
           displayName: pullRequest.author?.display_name ?? accountId,
+          avatarUrl: pullRequest.author?.links?.avatar?.href,
         });
       }
     }
@@ -175,6 +189,11 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
 
   setSort(sort: PullRequestSort): void {
     this.sort = sort;
+    this.refresh();
+  }
+
+  setFileLayout(layout: FileLayout): void {
+    this.fileLayout = layout;
     this.refresh();
   }
 

@@ -10,13 +10,13 @@ A VS Code extension for reviewing Bitbucket Cloud pull requests from the active 
 
 - Lists pull requests from the active Bitbucket Cloud repository.
 - Defaults to open pull requests with drafts hidden; filter by status and choose whether drafts are included.
-- Filters by author (all authors by default), picking from the authors of the loaded pull requests.
+- Filters by author (all authors by default), showing each author's Bitbucket avatar before their name, with an account icon when no avatar is available.
 - Sorts oldest-first or by most recently updated.
-- Expands changed files as folders and files in their repository paths.
+- Displays changed files in a folder tree (default) or a flat list with the file name followed by its folder path, such as `text.js - src/sub/folder`. Root-level files show only their names. Use **DiffSpark: Select File Layout** in the view toolbar or Command Palette, or set `diffspark.files.layout` to `tree` or `list`. The preference is saved and applies immediately.
 - Opens a side-by-side diff when clicking a changed file, using the common ancestor and the PR source commit from Bitbucket, including added, removed, and renamed files. Add inline comments to changed lines and view existing inline discussions directly in the diff.
 - The diff editor toolbar can open the file from the current checkout or check out the pull request source branch and open the file. Checking out warns before changing a dirty worktree; source branches from forks require that fork to be configured as a Git remote.
 - Shows the pull request description and Markdown comments, supports Markdown comments and threaded replies, and can approve, request changes, or merge.
-- Delete published comments using the trash icon on a diff comment or **Delete** in the pull request view. Deletion requires confirmation and Bitbucket permission (normally the comment's author); permission errors are shown without removing the comment locally. Deleted comments remain as placeholders so replies are preserved.
+- Delete published comments using the trash icon in the header of each of your own diff comments (including replies), or **Delete** in the pull request view. In the diff, the icon appears when you hover over or focus the comment; it is not a thread-wide action. Deletion requires confirmation and Bitbucket permission; permission errors are shown without removing the comment locally. Deleted comments remain as placeholders so replies are preserved.
 - **Request changes** uses Bitbucket's native change-request status and can optionally post a Markdown comment explaining what to adjust.
 - The merge dialog lets you choose a strategy, edit the commit message, and optionally close the source branch.
 - When Jira is connected, the merge dialog finds Jira issue keys in the PR title, description, and source branch. Select which issues to transition and their target statuses; Jira transitions run after the Bitbucket merge succeeds.
@@ -53,7 +53,7 @@ Providers (run **DiffSpark: Select AI Provider**):
    - `write:pullrequest:bitbucket` — approve, request changes, and merge pull requests.
    - `read:repository:bitbucket` — list changed files. Bitbucket redirects the pull request diffstat to the repository diffstat endpoint, which requires this scope.
    - `write:repository:bitbucket` — close the source branch after merging.
-   - `read:user:bitbucket` — identify your account so the pull request view shows whether you already approved or requested changes. Without it, the view still opens but shows the review state as "none" until you approve or request changes.
+   - `read:user:bitbucket` — identify your account so the diff shows the trash icon only on your own comments, and the pull request view shows whether you already approved or requested changes. Without it, existing diff comments have no trash icon and the extension warns you to reconnect with this scope; newly posted comments can still be deleted. The review state shows "none" until you approve or request changes.
 4. The credentials are stored in VS Code `SecretStorage`, not workspace settings or files.
 5. Open the **DiffSpark** activity bar view. Use its toolbar to refresh, select a repository, change filters, filter by author, or sort.
 6. Jira transitions are optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL, Jira account email, and an [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens). The token is used with HTTPS Basic authentication and stored in VS Code `SecretStorage`.

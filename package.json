@@ -79,6 +79,11 @@
         "icon": "$(sort-precedence)"
       },
       {
+        "title": "DiffSpark: Select File Layout",
+        "command": "bitbucketPrReviewer.selectFileLayout",
+        "icon": "$(list-tree)"
+      },
+      {
         "title": "DiffSpark: Open Pull Request",
         "command": "bitbucketPrReviewer.openPullRequest",
         "icon": "$(git-pull-request)"
@@ -164,6 +169,16 @@
     "configuration": {
       "title": "DiffSpark",
       "properties": {
+        "diffspark.files.layout": {
+          "type": "string",
+          "enum": ["tree", "list"],
+          "enumDescriptions": [
+            "Nest changed files in their repository folders.",
+            "Show changed files in a flat list with their folder paths as text."
+          ],
+          "default": "tree",
+          "description": "Layout of changed files under each pull request."
+        },
         "diffspark.ai.provider": {
           "type": "string",
           "enum": [
@@ -227,12 +242,14 @@
           "when": "commentController == diffspark"
         }
       ],
-      "comments/comment/context": [
+      "comments/comment/title": [
         {
           "command": "bitbucketPrReviewer.deleteDiffComment",
           "group": "inline@1",
-          "when": "commentController == diffspark && comment == diffsparkPostedComment"
-        },
+          "when": "commentController == diffspark && comment == diffsparkOwnComment"
+        }
+      ],
+      "comments/comment/context": [
         {
           "command": "bitbucketPrReviewer.aiSuggestionReplace",
           "group": "inline@1",
@@ -287,6 +304,11 @@
         }
       ],
       "view/title": [
+        {
+          "group": "navigation",
+          "command": "bitbucketPrReviewer.selectFileLayout",
+          "when": "view == bitbucketPrReviewer.pullRequests"
+        },
         {
           "group": "navigation",
           "command": "bitbucketPrReviewer.refresh",

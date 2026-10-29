@@ -8,9 +8,10 @@ const vm = require("node:vm");
 const root = path.resolve(__dirname, "../dist");
 const repository = { workspace: "team", slug: "repo", fullName: "team/repo" };
 const comments = [
-  { id: 10, content: { raw: "My comment" }, inline: { path: "app.js", to: 1 }, user: { display_name: "Ana" } },
-  { id: 11, parent: { id: 10 }, content: { raw: "A reply" } },
-  { id: 12, deleted: true, content: { raw: "Must not appear" }, inline: { path: "app.js", to: 2 } },
+  { id: 10, content: { raw: "My comment" }, inline: { path: "app.js", to: 1 }, user: { display_name: "Ana", account_id: "me" } },
+  { id: 11, parent: { id: 10 }, content: { raw: "A reply" }, user: { display_name: "Ana", account_id: "me" } },
+  { id: 12, deleted: true, content: { raw: "Must not appear" }, inline: { path: "app.js", to: 2 }, user: { account_id: "me" } },
+  { id: 13, parent: { id: 10 }, content: { raw: "Another person's reply" }, user: { display_name: "Ana", account_id: "other" } },
 ];
 
 function load(filename, overrides, cache = new Map()) {
@@ -33,7 +34,11 @@ function harness() {
   const errors = [];
   const deletions = [];
   const messages = [];
-  const state = { choice: "Delete", failure: undefined, confirmations: 0 };
+  const warnings = [];
+  const state = { choice: "Delete", failure: undefined, confirmations: 0, accountId: "me" };
+  const authorFilter = { authors: [], current: undefined, items: [], selected: undefined };
+  const fileLayout = { value: "tree", applied: undefined, updates: [], failure: undefined };
+  let configurationListener;
   const disposable = { dispose() {} };
   const uri = (value) => ({ fsPath: value, toString: () => value });
   const panel = {
@@ -43,6 +48,7 @@ function harness() {
   const api = {
     getComments: async () => comments.map((comment) => ({ ...comment })),
     getMyReviewState: async () => "none",
+    getCurrentAccountId: async () => state.accountId,
     getFileComparison: async () => ({ before: "old", after: "new" }),
     createComment: async () => ({ id: 20, content: { raw: "New comment" } }),
     deleteComment: async (...args) => {
@@ -51,11 +57,13 @@ function harness() {
     },
   };
   const vscode = {
+    ConfigurationTarget: { Global: 1 },
     CommentMode: { Preview: 0 },
     ViewColumn: { Active: 1 },
     MarkdownString: class { constructor(value) { this.value = value; } },
     Range: class { constructor(line) { this.start = { line }; } },
-    Uri: { from: ({ scheme, path }) => uri(scheme + ":" + path), joinPath: () => uri("/extension/icon") },
+    Uri: { from: ({ scheme, path }) => uri(scheme + ":" + path), joinPath: () => uri("/extension/icon"), parse: uri },
+    ThemeIcon: class { constructor(id) { this.id = id; } },
     commands: {
       registerCommand: (id, callback) => { commands.set(id, callback); return disposable; },
       executeCommand: async () => {},
@@ -75,9 +83,30 @@ function harness() {
       createTreeView: () => ({ ...disposable }),
       createWebviewPanel: () => panel,
       showErrorMessage: (error) => errors.push(error),
-      showWarningMessage: async () => { state.confirmations++; return state.choice; },
+      showQuickPick: async (items) => {
+        authorFilter.items = items;
+        return authorFilter.selected === undefined ? undefined : items[authorFilter.selected];
+      },
+      showWarningMessage: async (message, options) => {
+        if (!options?.modal) {
+          warnings.push(message);
+          return undefined;
+        }
+        state.confirmations++;
+        return state.choice;
+      },
     },
     workspace: {
+      getConfiguration: () => ({
+        get: () => fileLayout.value,
+        update: async (key, value, target) => {
+          if (fileLayout.failure) throw fileLayout.failure;
+          fileLayout.updates.push({ key, value, target });
+          fileLayout.value = value;
+          configurationListener({ affectsConfiguration: (key) => key === "diffspark.files.layout" });
+        },
+      }),
+      onDidChangeConfiguration: (listener) => { configurationListener = listener; return disposable; },
       registerTextDocumentContentProvider: () => disposable,
       onDidChangeWorkspaceFolders: () => disposable,
     },
@@ -94,11 +123,17 @@ function harness() {
   const overrides = {
     vscode,
     "./bitbucket/client": { BitbucketClient: class { constructor() { return api; } } },
-    "./views/pullRequestTreeProvider": { PullRequestTreeProvider: class { refresh() {} } },
+    "./views/pullRequestTreeProvider": { PullRequestTreeProvider: class {
+      refresh() {}
+      getAuthors() { return authorFilter.authors; }
+      getAuthor() { return authorFilter.current; }
+      setAuthor(author) { authorFilter.current = author; }
+      setFileLayout(layout) { fileLayout.applied = layout; }
+    } },
     "./ai/service": { CommentImprover: class {} },
   };
   return {
-    api, commands, threads, errors, deletions, messages, state, panel, overrides,
+    api, commands, threads, errors, deletions, messages, warnings, state, panel, overrides, authorFilter, fileLayout,
     async openDiff() {
       const { activate } = load(path.join(root, "extension.js"), overrides);
       await activate({
@@ -121,6 +156,159 @@ function harness() {
   };
 }
 
+test("file layout picker saves the choice, applies configuration changes, and handles cancellation and errors", async () => {
+  const h = harness();
+  h.fileLayout.value = "list";
+  await h.openDiff();
+  assert.equal(h.fileLayout.applied, "list");
+  const selectLayout = h.commands.get("bitbucketPrReviewer.selectFileLayout");
+  await selectLayout();
+  assert.equal(h.authorFilter.items[1].description, "(current)");
+  assert.deepEqual(h.fileLayout.updates, []);
+  h.authorFilter.selected = 0;
+  await selectLayout();
+  assert.deepEqual(h.fileLayout.updates, [{ key: "files.layout", value: "tree", target: 1 }]);
+  assert.equal(h.fileLayout.applied, "tree");
+  h.authorFilter.selected = 1;
+  await selectLayout();
+  assert.equal(h.fileLayout.applied, "list");
+  h.fileLayout.failure = new Error("Cannot save settings");
+  h.authorFilter.selected = 0;
+  await selectLayout();
+  assert.equal(h.fileLayout.applied, "list");
+  assert.match(h.errors[0], /Cannot save settings/);
+});
+
+test("changed files switch between the default folder tree and a flat list without changing file actions", async () => {
+  let refreshes = 0;
+  const errors = [];
+  const { PullRequestTreeProvider, PullRequestNode } = load(path.join(root, "views/pullRequestTreeProvider.js"), {
+    vscode: {
+      TreeItem: class {
+        constructor(label, collapsibleState) { Object.assign(this, { label, collapsibleState }); }
+      },
+      TreeItemCollapsibleState: { Collapsed: 1, None: 0 },
+      EventEmitter: class { fire() { refreshes++; } dispose() {} },
+      Uri: { from: (uri) => uri },
+      ThemeIcon: { File: "file", Folder: "folder" },
+    },
+  });
+  const files = [
+    { path: "src/sub/folder/text.js", status: "modified" },
+    { path: "src/sub/folder1/somefile.jsx", status: "added" },
+    { path: "other/text.js", status: "removed" },
+    { path: "README.md", status: "modified" },
+    { path: "new/renamed.js", oldPath: "old/original.js", status: "renamed" },
+  ];
+  const pr = new PullRequestNode({
+    id: 42, title: "PR", state: "OPEN",
+    source: { branch: { name: "feature" }, repository: { full_name: "fork/repo" } },
+    destination: { branch: { name: "main" } },
+  });
+  const provider = new PullRequestTreeProvider(
+    () => ({ getChangedFiles: async () => files }),
+    () => repository,
+    (error) => errors.push(error),
+  );
+  const tree = await provider.getChildren(pr);
+  assert.deepEqual(tree.map((node) => node.label), ["new", "other", "src", "README.md"]);
+  const src = tree.find((node) => node.label === "src");
+  const sub = (await provider.getChildren(src))[0];
+  const folder = (await provider.getChildren(sub))[0];
+  const nestedFile = (await provider.getChildren(folder))[0];
+  assert.equal(nestedFile.label, "text.js");
+  assert.equal(nestedFile.description, undefined);
+  provider.setFileLayout("list");
+  assert.equal(refreshes, 1);
+  const list = await provider.getChildren(pr);
+  assert.deepEqual(list.map((node) => [node.label, node.description]), [
+    ["README.md", undefined],
+    ["renamed.js", "- new"],
+    ["somefile.jsx", "- src/sub/folder1"],
+    ["text.js", "- other"],
+    ["text.js", "- src/sub/folder"],
+  ]);
+  for (const node of list) {
+    assert.equal(node.collapsibleState, 0);
+    assert.equal(node.iconPath, "file");
+    assert.equal(node.contextValue, "bitbucketChangedFile");
+    assert.deepEqual(await provider.getChildren(node), []);
+    assert.equal(node.command.command, "bitbucketPrReviewer.openChangedFile");
+    assert.deepEqual(node.command.arguments, [
+      repository, 42, files.find((file) => file.path === node.tooltip), "feature", "fork/repo",
+    ]);
+  }
+  assert.deepEqual(list[4].command, nestedFile.command);
+  assert.deepEqual(list[4].resourceUri, nestedFile.resourceUri);
+  provider.setFileLayout("tree");
+  assert.deepEqual((await provider.getChildren(pr)).map((node) => node.label), tree.map((node) => node.label));
+  files.length = 0;
+  provider.setFileLayout("list");
+  assert.deepEqual(await provider.getChildren(pr), []);
+  assert.deepEqual(errors, []);
+  provider.dispose();
+});
+
+test("author filter shows avatars before names, falls back to icons, and preserves selection", async () => {
+  const h = harness();
+  await h.openDiff();
+  const ana = { accountId: "ana", displayName: "Ana", avatarUrl: "https://example.com/ana.png" };
+  const bob = { accountId: "bob", displayName: "Bob" };
+  h.authorFilter.authors = [ana, bob];
+  h.authorFilter.selected = 1;
+  const filter = h.commands.get("bitbucketPrReviewer.filterByAuthor");
+  await filter();
+  const [all, avatar, fallback] = h.authorFilter.items;
+  assert.equal(all.label, "All authors");
+  assert.equal(all.iconPath.id, "organization");
+  assert.equal(avatar.label, "Ana");
+  assert.equal(avatar.iconPath.toString(), ana.avatarUrl);
+  assert.equal(fallback.label, "Bob");
+  assert.equal(fallback.iconPath.id, "account");
+  assert.equal(h.authorFilter.current, ana);
+  h.authorFilter.selected = undefined;
+  await filter();
+  assert.equal(h.authorFilter.items[1].description, "(current)");
+  assert.equal(h.authorFilter.current, ana);
+  h.authorFilter.selected = 0;
+  await filter();
+  assert.equal(h.authorFilter.current, undefined);
+  assert.deepEqual(h.errors, []);
+});
+
+test("tree provider carries Bitbucket avatar URLs into the sorted author list and retains the active author", async () => {
+  const errors = [];
+  const { PullRequestTreeProvider } = load(path.join(root, "views/pullRequestTreeProvider.js"), {
+    vscode: {
+      TreeItem: class {},
+      TreeItemCollapsibleState: { Collapsed: 1 },
+      EventEmitter: class { fire() {} dispose() {} },
+    },
+  });
+  const author = { account_id: "ana", display_name: "Ana", links: { avatar: { href: "https://example.com/ana.png" } } };
+  let pullRequests = [author, author, { account_id: "bob", display_name: "Bob" }, undefined].map((author, id) => ({
+    id, author, title: "PR", state: "OPEN",
+    source: { branch: { name: "feature" } }, destination: { branch: { name: "main" } },
+  }));
+  const provider = new PullRequestTreeProvider(
+    () => ({ listPullRequests: async () => pullRequests }),
+    () => repository,
+    (error) => errors.push(error),
+  );
+  await provider.getChildren();
+  assert.deepEqual(provider.getAuthors(), [
+    { accountId: "ana", displayName: "Ana", avatarUrl: "https://example.com/ana.png" },
+    { accountId: "bob", displayName: "Bob", avatarUrl: undefined },
+  ]);
+  provider.setAuthor(provider.getAuthors()[0]);
+  assert.equal((await provider.getChildren()).length, 2);
+  pullRequests = [];
+  await provider.getChildren();
+  assert.equal(provider.getAuthors()[0].avatarUrl, author.links.avatar.href);
+  assert.deepEqual(errors, []);
+  provider.dispose();
+});
+
 test("native diff deletes published comments and replies, preserving the thread and drafts", async () => {
   const h = harness();
   await h.openDiff();
@@ -129,7 +317,9 @@ test("native diff deletes published comments and replies, preserving the thread 
   const reply = thread.comments[1];
   const draft = { body: "Unsent draft", ai: { kind: "draft" } };
   thread.comments = [...thread.comments, draft];
-  assert.equal(rootComment.contextValue, "diffsparkPostedComment");
+  assert.equal(rootComment.contextValue, "diffsparkOwnComment");
+  assert.equal(reply.contextValue, "diffsparkOwnComment");
+  assert.equal(thread.comments[2].contextValue, undefined);
   assert.equal(h.threads[1].comments[0].contextValue, undefined);
   assert.match(h.threads[1].comments[0].body.value, /Comment deleted/);
   await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(rootComment);
@@ -137,10 +327,10 @@ test("native diff deletes published comments and replies, preserving the thread 
   assert.match(thread.comments[0].body.value, /Comment deleted/);
   assert.equal(thread.comments[0].contextValue, undefined);
   assert.equal(thread.comments[1], reply);
-  assert.equal(thread.comments[2], draft);
+  assert.equal(thread.comments[3], draft);
   await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(reply);
   assert.deepEqual(h.deletions[1], [repository, 42, 11]);
-  assert.equal(thread.comments[2], draft);
+  assert.equal(thread.comments[3], draft);
   assert.deepEqual(h.errors, []);
 });
 
@@ -163,7 +353,7 @@ test("new native comments immediately expose the delete action", async () => {
   await h.openDiff();
   await h.commands.get("bitbucketPrReviewer.replyDiffComment")({ thread: h.threads[0], text: "New comment" });
   const comment = h.threads[0].comments.at(-1);
-  assert.equal(comment.contextValue, "diffsparkPostedComment");
+  assert.equal(comment.contextValue, "diffsparkOwnComment");
   await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(comment);
   assert.deepEqual(h.deletions, [[repository, 42, 20]]);
 });
@@ -208,11 +398,38 @@ test("webview cancellation and permission errors retain the published comment", 
   assert.equal(view.comments.find((comment) => comment.id === 11).deleted, undefined);
 });
 
-test("manifest wires the native delete action only to published DiffSpark comments", () => {
+test("native diff does not allow deleting other people's comments with the same display name", async () => {
+  const h = harness();
+  await h.openDiff();
+  const otherComment = h.threads[0].comments[2];
+  assert.equal(otherComment.contextValue, undefined);
+  await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(otherComment);
+  assert.equal(h.state.confirmations, 0);
+  assert.equal(h.deletions.length, 0);
+  assert.match(h.errors[0], /no longer available/);
+});
+
+test("native diff warns when identity is unavailable but newly posted comments remain deletable", async () => {
+  const h = harness();
+  h.state.accountId = undefined;
+  await h.openDiff();
+  assert.equal(h.warnings.length, 1);
+  assert.match(h.warnings[0], /read:user:bitbucket/);
+  assert.ok(h.threads.every((thread) => thread.comments.every((comment) => comment.contextValue === undefined)));
+  await h.commands.get("bitbucketPrReviewer.replyDiffComment")({ thread: h.threads[0], text: "New comment" });
+  const comment = h.threads[0].comments.at(-1);
+  assert.equal(comment.contextValue, "diffsparkOwnComment");
+  await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(comment);
+  assert.deepEqual(h.deletions, [[repository, 42, 20]]);
+});
+
+test("manifest puts the trash icon in the preview comment title, not the editing actions", () => {
   const { contributes } = require("../package.json");
   const id = "bitbucketPrReviewer.deleteDiffComment";
   assert.equal(contributes.commands.find((command) => command.command === id).icon, "$(trash)");
   assert.deepEqual(contributes.menus["commandPalette"].find((command) => command.command === id), { command: id, when: "false" });
-  assert.match(contributes.menus["comments/comment/context"].find((command) => command.command === id).when,
-    /commentController == diffspark && comment == diffsparkPostedComment/);
+  const titleAction = contributes.menus["comments/comment/title"].find((command) => command.command === id);
+  assert.equal(titleAction.group, "inline@1");
+  assert.equal(titleAction.when, "commentController == diffspark && comment == diffsparkOwnComment");
+  assert.equal(contributes.menus["comments/comment/context"].some((command) => command.command === id), false);
 });

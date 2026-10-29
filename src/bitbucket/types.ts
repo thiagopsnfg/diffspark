@@ -19,6 +19,9 @@ export interface PullRequest {
   author?: {
     display_name?: string;
     account_id?: string;
+    links?: {
+      avatar?: { href?: string };
+    };
   };
   source: {
     commit?: { hash: string };
@@ -64,6 +67,7 @@ export interface PullRequestComment {
   };
   created_on?: string;
   user?: {
+    account_id?: string;
     display_name?: string;
   };
 }

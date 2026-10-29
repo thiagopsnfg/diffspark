@@ -203,7 +203,7 @@ export class BitbucketClient {
     return this.request(new URL(path, API_ORIGIN).toString(), { method: "DELETE" });
   }
 
-  async getMyReviewState(repository: BitbucketRepository, pullRequestId: number): Promise<ReviewState> {
+  getCurrentAccountId(): Promise<string | undefined> {
     if (!this.currentAccountId) {
       const accountId = this.request<{ account_id: string }>(
         new URL(`${API_VERSION_PREFIX}user`, API_ORIGIN).toString(),
@@ -222,8 +222,12 @@ export class BitbucketClient {
         }
       });
     }
+    return this.currentAccountId;
+  }
+
+  async getMyReviewState(repository: BitbucketRepository, pullRequestId: number): Promise<ReviewState> {
     const [accountId, pullRequest] = await Promise.all([
-      this.currentAccountId,
+      this.getCurrentAccountId(),
       this.request<PullRequest>(
         new URL(this.pullRequestPath(repository, pullRequestId, ""), API_ORIGIN).toString(),
         { method: "GET" },

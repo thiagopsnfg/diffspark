@@ -3,7 +3,7 @@ import { BitbucketClient } from "./bitbucket/client";
 import { JiraClient } from "./jira/client";
 import { parseBitbucketRemoteUrl } from "./bitbucket/repository";
 import { PullRequestWebview } from "./views/pullRequestWebview";
-import { PullRequestAuthor, PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
+import { FileLayout, PullRequestAuthor, PullRequestTreeProvider } from "./views/pullRequestTreeProvider";
 import {
   PullRequest,
   PullRequestState,
@@ -141,6 +141,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     getSelectedBitbucketRepository,
     reportError,
   );
+  const updateFileLayout = (): void => {
+    provider.setFileLayout(vscode.workspace.getConfiguration("diffspark").get<FileLayout>("files.layout", "tree"));
+  };
+  updateFileLayout();
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+    if (event.affectsConfiguration("diffspark.files.layout")) {
+      updateFileLayout();
+    }
+  }));
   const tree = vscode.window.createTreeView("bitbucketPrReviewer.pullRequests", {
     treeDataProvider: provider,
     showCollapseAll: true,
@@ -437,6 +446,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const diffContents = new Map<string, string>();
   const diffMetadata = new Map<string, DiffMetadata>();
   let diffSequence = 0;
+  let identityWarningShown = false;
   const commentController = vscode.comments.createCommentController("diffspark", "DiffSpark");
   commentController.options = {
     prompt: "Add a comment to this pull request",
@@ -494,14 +504,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await vscode.window.showTextDocument(fileUri, { preview: false });
   };
 
-  const toDiffComment = (comment: PullRequestComment, thread: vscode.CommentThread): DiffComment => ({
+  const toDiffComment = (comment: PullRequestComment, thread: vscode.CommentThread, isOwnComment: boolean): DiffComment => ({
     body: new vscode.MarkdownString(comment.deleted ? "_Comment deleted._" : comment.content?.raw ?? comment.content?.html ?? ""),
     mode: vscode.CommentMode.Preview,
     author: { name: comment.user?.display_name ?? "Unknown" },
     ...(comment.created_on ? { timestamp: new Date(comment.created_on) } : {}),
     bitbucketId: comment.id,
     thread,
-    contextValue: comment.deleted ? undefined : "diffsparkPostedComment",
+    contextValue: !comment.deleted && isOwnComment ? "diffsparkOwnComment" : undefined,
   });
 
   const loadInlineComments = async (
@@ -511,7 +521,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     repository: BitbucketRepository,
     pullRequestId: number,
   ): Promise<void> => {
-    const comments = await getClient().getComments(repository, pullRequestId);
+    const [comments, accountId] = await Promise.all([
+      getClient().getComments(repository, pullRequestId),
+      getClient().getCurrentAccountId(),
+    ]);
+    if (accountId === undefined && !identityWarningShown) {
+      identityWarningShown = true;
+      const message = "To show the delete icon on your existing diff comments, reconnect with a Bitbucket API token that includes read:user:bitbucket.";
+      output.appendLine(`[${new Date().toISOString()}] ${message}`);
+      void vscode.window.showWarningMessage(`DiffSpark: ${message}`);
+    }
     const threadByCommentId = new Map<number, vscode.CommentThread>();
     const rootComments = comments.filter((comment) => !comment.parent);
 
@@ -537,7 +556,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         new vscode.Range(line - 1, 0, line - 1, 0),
         [],
       );
-      thread.comments = [toDiffComment(comment, thread)];
+      thread.comments = [toDiffComment(comment, thread, accountId !== undefined && comment.user?.account_id === accountId)];
       threadByCommentId.set(comment.id, thread);
     }
 
@@ -547,7 +566,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const thread = threadByCommentId.get(comment.parent.id);
       if (thread) {
-        thread.comments = [...thread.comments, toDiffComment(comment, thread)];
+        thread.comments = [...thread.comments, toDiffComment(comment, thread, accountId !== undefined && comment.user?.account_id === accountId)];
       }
     }
   };
@@ -580,7 +599,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     const posted = thread.comments.filter((comment) => !isAiComment(comment));
     const drafts = thread.comments.filter(isAiComment);
-    thread.comments = [...posted, toDiffComment(created, thread), ...drafts];
+    thread.comments = [...posted, toDiffComment(created, thread, true), ...drafts];
     return true;
   };
 
@@ -690,7 +709,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       "bitbucketPrReviewer.deleteDiffComment",
       (comment: DiffComment) => runAction(async () => {
-        if (!comment || comment.contextValue !== "diffsparkPostedComment" ||
+        if (!comment || comment.contextValue !== "diffsparkOwnComment" ||
             !comment.thread?.comments.includes(comment)) {
           throw new Error("This pull request comment is no longer available.");
         }
@@ -982,11 +1001,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           [
             {
               label: "All authors",
+              iconPath: new vscode.ThemeIcon("organization"),
               description: current ? undefined : "(current)",
               author: undefined as PullRequestAuthor | undefined,
             },
             ...authors.map((author) => ({
               label: author.displayName,
+              iconPath: author.avatarUrl
+                ? vscode.Uri.parse(author.avatarUrl)
+                : new vscode.ThemeIcon("account"),
               description: author.accountId === current?.accountId ? "(current)" : undefined,
               author,
             })),
@@ -1014,6 +1037,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
         if (selected) {
           provider.setSort(selected.value);
+        }
+      }),
+    ),
+    vscode.commands.registerCommand("bitbucketPrReviewer.selectFileLayout", () =>
+      runAction(async () => {
+        const configuration = vscode.workspace.getConfiguration("diffspark");
+        const current = configuration.get<FileLayout>("files.layout", "tree");
+        const selected = await vscode.window.showQuickPick(
+          [
+            { label: "Tree", detail: "Nest changed files in folders", value: "tree" as const },
+            { label: "List", detail: "Show file names followed by their folder paths", value: "list" as const },
+          ].map((item) => ({ ...item, description: item.value === current ? "(current)" : undefined })),
+          { placeHolder: "Choose changed files layout" },
+        );
+        if (selected) {
+          await configuration.update("files.layout", selected.value, vscode.ConfigurationTarget.Global);
         }
       }),
     ),
