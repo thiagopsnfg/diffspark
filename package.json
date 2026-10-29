@@ -2,7 +2,7 @@
   "name": "diffspark",
   "displayName": "DiffSpark",
   "description": "Smarter reviews. Better code. Review Bitbucket Cloud pull requests from VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "thiagopsnfg",
   "repository": {
     "type": "git",
