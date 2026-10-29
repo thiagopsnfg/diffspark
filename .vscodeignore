@@ -6,6 +6,12 @@ src/**
 test/**
 tsconfig.json
 images/**
+.github/**
+.husky/**
+.gitignore
+.lintstagedrc.js
+jsconfig.json
+*.vsix
 biome.json
 *.vsix
 node_modules/@types/**
