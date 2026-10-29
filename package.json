@@ -8,6 +8,9 @@
     "type": "git",
     "url": "https://github.com/thiagopsnfg/diffspark.git"
   },
+  "bugs": {
+    "url": "https://github.com/thiagopsnfg/diffspark/issues"
+  },
   "icon": "resources/diffspark-icon.png",
   "license": "MIT",
   "engines": {
