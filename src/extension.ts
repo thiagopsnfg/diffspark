@@ -1,3 +1,17 @@
+import type {
+    PullRequest,
+    ChangedFile,
+    PullRequestState,
+    PullRequestComment,
+    BitbucketRepository,
+} from "./bitbucket/types";
+import {
+    categoryLabel,
+    SEVERITY_LABELS,
+    formatFindingComment,
+    formatSummaryComment,
+    type ReviewCommentOptions,
+} from "./ai/review/parse";
 import * as vscode from "vscode";
 import {JiraClient} from "./jira/client";
 import {CommentImprover} from "./ai/service";
@@ -9,24 +23,12 @@ import type {AiReviewHost} from "./views/pullRequestWebview";
 import {PullRequestWebview} from "./views/pullRequestWebview";
 import {parseBitbucketRemoteUrl} from "./bitbucket/repository";
 import {buildCodeSnippet, describeImproveOptions, type ImproveOptions} from "./ai/prompt";
+
 import {
     type FileLayout,
     type PullRequestAuthor,
     PullRequestTreeProvider,
 } from "./views/pullRequestTreeProvider";
-import {
-    categoryLabel,
-    formatFindingComment,
-    formatSummaryComment,
-    SEVERITY_LABELS,
-} from "./ai/review/parse";
-import type {
-    PullRequest,
-    PullRequestState,
-    BitbucketRepository,
-    ChangedFile,
-    PullRequestComment,
-} from "./bitbucket/types";
 
 const EMAIL_SECRET = "bitbucket-pr-reviewer.email";
 const TOKEN_SECRET = "bitbucket-pr-reviewer.api-token";
@@ -783,28 +785,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
+    const getReviewCommentOptions = (resource?: vscode.Uri): ReviewCommentOptions => ({
+        includeHeader: vscode.workspace
+            .getConfiguration("diffspark.ai.review.comments", resource)
+            .get<boolean>("includeHeader", true),
+    });
+
     const createFindingComment = (
         thread: vscode.CommentThread,
         finding: AiReviewFinding,
         key: string,
-    ): AiComment => ({
-        body: new vscode.MarkdownString(formatFindingComment(finding)),
-        mode: vscode.CommentMode.Preview,
-        author: {name: "AI review · not posted", iconPath: aiAuthorIcon},
-        label: `${SEVERITY_LABELS[finding.severity]} · ${categoryLabel(finding)}`,
-        contextValue: AI_CONTEXT_VALUES.draft,
-        ai: {
-            kind: "draft",
-            thread,
-            original: formatFindingComment(finding),
-            options: {action: "improve"},
-            finding: {
-                key,
-                id: finding.id,
-                ...(finding.line === undefined ? {} : {line: finding.line}),
+    ): AiComment => {
+        const text = formatFindingComment(
+            finding,
+            getReviewCommentOptions(selectedRepository?.handle.rootUri),
+        );
+        return {
+            body: new vscode.MarkdownString(text),
+            mode: vscode.CommentMode.Preview,
+            author: {name: "AI review · not posted", iconPath: aiAuthorIcon},
+            label: `${SEVERITY_LABELS[finding.severity]} · ${categoryLabel(finding)}`,
+            contextValue: AI_CONTEXT_VALUES.draft,
+            ai: {
+                thread,
+                kind: "draft",
+                original: text,
+                options: {action: "improve"},
+                finding: {
+                    key,
+                    id: finding.id,
+                    ...(finding.line === undefined ? {} : {line: finding.line}),
+                },
             },
-        },
-    });
+        };
+    };
 
     const addFindingThreads = (uriString: string): void => {
         const metadata = diffMetadata.get(uriString);
@@ -1055,6 +1069,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         repository: BitbucketRepository,
     ): AiReviewHost => {
         const key = aiReviewKey(repository, pullRequest.id);
+        const resource =
+            selectedRepository?.bitbucket.fullName === repository.fullName
+                ? selectedRepository.handle.rootUri
+                : undefined;
         const findFindings = (ids: readonly string[]): AiReviewFinding[] => {
             const wanted = new Set(ids);
             return (
@@ -1138,7 +1156,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                             await getClient().createComment(
                                 repository,
                                 pullRequest.id,
-                                formatFindingComment(finding),
+                                formatFindingComment(
+                                    finding,
+                                    getReviewCommentOptions(resource),
+                                ),
                                 undefined,
                                 inline,
                             );
@@ -1149,7 +1170,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                             await getClient().createComment(
                                 repository,
                                 pullRequest.id,
-                                formatFindingComment(finding, {includeLocation: true}),
+                                formatFindingComment(finding, {
+                                    ...getReviewCommentOptions(resource),
+                                    includeLocation: true,
+                                }),
                             );
                         }
                         posted.push(finding.id);
@@ -1172,7 +1196,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 await getClient().createComment(
                     repository,
                     pullRequest.id,
-                    formatSummaryComment(result),
+                    formatSummaryComment(result, getReviewCommentOptions(resource)),
                 );
             },
         };

@@ -284,16 +284,16 @@ export function sortFindings(findings: readonly AiReviewFinding[]): AiReviewFind
 }
 
 export const SEVERITY_LABELS: Record<ReviewSeverity, string> = {
-    blocker: "⛔ Blocker",
-    major: "🟠 Major",
-    minor: "🟡 Minor",
-    nit: "⚪ Nit",
+    blocker: "Blocker",
+    major: "Major",
+    minor: "Minor",
+    nit: "Nit",
 };
 
 export const VERDICT_LABELS: Record<ReviewVerdict, string> = {
-    approve: "✅ Looks good",
-    comment: "💬 Suggestions",
-    request_changes: "⛔ Changes needed",
+    approve: "Looks good",
+    comment: "Suggestions",
+    request_changes: "Changes needed",
 };
 
 const CATEGORY_LABELS: Record<ReviewCategory, string> = {
@@ -352,37 +352,48 @@ export function fenceLanguage(path: string): string {
     return FENCE_LANGUAGES[extension] ?? "";
 }
 
+export interface ReviewCommentOptions {
+    includeHeader?: boolean;
+}
+
 /** Markdown posted to Bitbucket for a finding. */
 export function formatFindingComment(
     finding: AiReviewFinding,
-    options: {includeLocation?: boolean} = {},
+    options: ReviewCommentOptions & {includeLocation?: boolean} = {},
 ): string {
+    const includeHeader = options.includeHeader !== false;
     const location = options.includeLocation
-        ? ` · \`${finding.file}${finding.line ? `:${finding.line}` : ""}\``
+        ? `\`${finding.file}${finding.line ? `:${finding.line}` : ""}\``
         : "";
-    const parts = [
-        `**${SEVERITY_LABELS[finding.severity]} · ${categoryLabel(finding)}**${location} — ${finding.title}`,
-    ];
-    if (finding.body && finding.body !== finding.title) {
-        parts.push(finding.body);
-    }
-    if (finding.suggestion) {
-        parts.push(`\`\`\`${fenceLanguage(finding.file)}\n${finding.suggestion}\n\`\`\``);
-    }
-    return parts.join("\n\n");
+    const metadata = `**${SEVERITY_LABELS[finding.severity]} · ${categoryLabel(finding)}**`;
+    const header = includeHeader
+        ? `${[metadata, location].filter(Boolean).join(" · ")} — ${finding.title}`
+        : location;
+    const body = finding.body || finding.title;
+    const repeatsTitle = includeHeader && body === finding.title;
+    const suggestion = finding.suggestion
+        ? `\`\`\`${fenceLanguage(finding.file)}\n${finding.suggestion}\n\`\`\``
+        : "";
+
+    return [header, repeatsTitle ? "" : body, suggestion].filter(Boolean).join("\n\n");
 }
 
 export function formatSummaryComment(
     result: Pick<AiReviewResult, "verdict" | "summary" | "findings">,
+    options: ReviewCommentOptions = {},
 ): string {
+    const includeHeader = options.includeHeader !== false;
     const open = result.findings.filter((finding) => finding.status !== "dismissed");
-    const parts = [`### ${VERDICT_LABELS[result.verdict]}`, result.summary];
+    const parts = [result.summary];
+    if (includeHeader) {
+        parts.unshift(`### ${VERDICT_LABELS[result.verdict]}`);
+    }
     if (open.length > 0) {
         parts.push(
             open
                 .map(
                     (finding) =>
-                        `- **${SEVERITY_LABELS[finding.severity]}** \`${finding.file}${finding.line ? `:${finding.line}` : ""}\` — ${finding.title}`,
+                        `- ${includeHeader ? `**${SEVERITY_LABELS[finding.severity]}** ` : ""}\`${finding.file}${finding.line ? `:${finding.line}` : ""}\` — ${finding.title}`,
                 )
                 .join("\n"),
         );

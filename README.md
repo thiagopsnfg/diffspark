@@ -116,11 +116,13 @@ Choose a provider with **DiffSpark: Select AI Provider**:
 
 Click the ✦ icon next to a pull request (or run **DiffSpark: Review Pull Request with AI**). DiffSpark sends the changes to your AI provider and shows the result in the **AI Review** section of the pull request view:
 
-- **Verdict**: ✅ *Looks good*, 💬 *Comments*, or ⛔ *Changes needed*, plus a short summary of what the PR does.
-- **Findings** grouped by severity (🔴 blocker, 🟠 major, 🟡 minor, ⚪ nit). Each one has a file and line, an explanation, an optional suggested fix, and a confidence score. Violations of your rules are tagged *Team rule*.
+- **Verdict**: *Looks good*, *Comments*, or *Changes needed*, plus a short summary of what the PR does.
+- **Findings** grouped by severity (blocker, major, minor, nit). Each one has a file and line, an explanation, an optional suggested fix, and a confidence score. Violations of your rules are tagged *Team rule*.
 - **Drafts in the diff**: open a changed file and the findings appear on their lines as *AI review · not posted* drafts.
 
 **Nothing is posted automatically.** For each finding you can click **Post comment** to publish it as a Bitbucket inline comment (it falls back to a general comment when the line is no longer in the diff). You can also click its location to open the diff and edit the draft before posting, or **Dismiss** it. You can also post several at once with **Post selected**, or use **Post summary as comment**. Then **Approve** or **Request changes** in one click.
+
+Review comments use plain text labels without decorative emojis, and the AI is instructed not to add emojis to its review text. Disable `diffspark.ai.review.comments.includeHeader` to omit the severity, category and title header from comments, leaving the explanation and suggested code. The same setting hides the verdict heading and severity labels in posted summaries; file locations are preserved. Severity remains visible in the review interface.
 
 How it works:
 
@@ -266,6 +268,7 @@ Optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL (`*
 | `diffspark.ai.model` | `""` | Optional model override (Copilot model family or OpenAI/Gemini model name). |
 | `diffspark.ai.openaiBaseUrl` | `https://api.openai.com/v1` | Base URL for OpenAI-compatible endpoints (Azure OpenAI, OpenRouter, local servers…). |
 | `diffspark.ai.review.language` | `""` | Language of the AI review (for example `Portuguese (Brazil)` or `pt-br`). Empty uses the VS Code display language. |
+| `diffspark.ai.review.comments.includeHeader` | `true` | Include severity, category and title headers in review comments, and verdict/severity labels in posted summaries. |
 | `diffspark.ai.review.minSeverity` | `minor` | Lowest severity shown: `nit`, `minor`, `major`, or `blocker`. |
 | `diffspark.ai.review.minConfidence` | `0.5` | Hide findings the AI is less confident about (0–1). |
 | `diffspark.ai.review.exclude` | `[]` | Extra glob patterns of files to skip (lock files, build output, and binaries are always skipped). |
