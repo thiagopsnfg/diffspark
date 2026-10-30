@@ -1,4 +1,3 @@
-import * as https from "node:https";
 import type {
     HttpMethod,
     ChangedFile,
@@ -15,6 +14,8 @@ import type {
     BitbucketRepository,
     PullRequestInlineComment,
 } from "./types";
+import * as https from "node:https";
+import {getReviewState} from "./reviewState";
 
 const API_ORIGIN = "https://api.bitbucket.org";
 const API_VERSION_PREFIX = "/2.0/";
@@ -95,6 +96,7 @@ export class BitbucketClient {
         const url = new URL(path, API_ORIGIN);
         url.searchParams.set("pagelen", String(PAGE_LENGTH));
         url.searchParams.set("sort", sort);
+        url.searchParams.set("fields", "+values.participants");
         if (states.length > 0) {
             const stateQuery =
                 states.length === 1
@@ -331,18 +333,7 @@ export class BitbucketClient {
                 {method: "GET"},
             ),
         ]);
-        if (accountId === undefined) {
-            return "none";
-        }
-        const participant = pullRequest.participants?.find(
-            (entry) => entry.user?.account_id === accountId,
-        );
-        if (participant?.state === "changes_requested") {
-            return "changes_requested";
-        }
-        return participant?.state === "approved" || participant?.approved
-            ? "approved"
-            : "none";
+        return getReviewState(pullRequest, accountId);
     }
 
     merge(

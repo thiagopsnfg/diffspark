@@ -64,7 +64,7 @@ export class PullRequestWebview {
         private readonly repository: BitbucketRepository,
         private readonly client: BitbucketClient,
         private readonly onError: (error: unknown) => void,
-        private readonly onMerged: () => void,
+        private readonly onPullRequestChanged: () => void,
         private readonly getJiraClient: () => JiraClient | undefined,
         private readonly ensureJiraClient: () => Promise<boolean>,
         private readonly improver: CommentImprover,
@@ -96,7 +96,7 @@ export class PullRequestWebview {
         repository: BitbucketRepository,
         client: BitbucketClient,
         onError: (error: unknown) => void,
-        onMerged: () => void,
+        onPullRequestChanged: () => void,
         getJiraClient: () => JiraClient | undefined,
         ensureJiraClient: () => Promise<boolean>,
         improver: CommentImprover,
@@ -114,7 +114,7 @@ export class PullRequestWebview {
             repository,
             client,
             onError,
-            onMerged,
+            onPullRequestChanged,
             getJiraClient,
             ensureJiraClient,
             improver,
@@ -431,6 +431,7 @@ export class PullRequestWebview {
         } else {
             await this.client.approve(this.repository, this.pullRequest.id);
         }
+        this.onPullRequestChanged();
         void vscode.window.showInformationMessage(
             `Pull request #${this.pullRequest.id} ${approved ? "unapproved" : "approved"}.`,
         );
@@ -440,6 +441,7 @@ export class PullRequestWebview {
     private async requestChanges(): Promise<void> {
         if (this.reviewState === "changes_requested") {
             await this.client.removeChangeRequest(this.repository, this.pullRequest.id);
+            this.onPullRequestChanged();
             void vscode.window.showInformationMessage(
                 `Change request removed from pull request #${this.pullRequest.id}.`,
             );
@@ -460,6 +462,7 @@ export class PullRequestWebview {
             return;
         }
         await this.client.requestChanges(this.repository, this.pullRequest.id);
+        this.onPullRequestChanged();
         await this.refresh();
         const comment = reason.trim();
         if (comment) {
@@ -565,7 +568,7 @@ export class PullRequestWebview {
             closeSourceBranch,
             commitMessage.trim(),
         );
-        this.onMerged();
+        this.onPullRequestChanged();
         const results = await Promise.allSettled(
             transitions.map(({issueKey, transitionId}) =>
                 jira!.transition(issueKey, transitionId),

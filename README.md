@@ -174,6 +174,8 @@ Focus on what matters right now, straight from the **Pull Requests** view toolba
 - **Author** — every author appears with their Bitbucket avatar. The active author is shown next to the view title so you always know what you are looking at.
 - **Sort** — switch anytime between **Recently updated** (newest activity first) to keep up with ongoing discussions, and **Oldest** (oldest pull requests first) to clear the review backlog.
 
+The list also shows your Bitbucket review status: a green check for **Approved by you**, an amber change-request icon for **Changes requested by you**, and a neutral PR icon otherwise. Hover over a PR for details. Your status updates when you review through DiffSpark or refresh the list after reviewing on Bitbucket. Identifying your account requires the token's `read:user:bitbucket` scope.
+
 <p align="center">
   <img src="images/pr-filters.gif" alt="Filtering pull requests by status, drafts, and author, then sorting by Oldest and back to Recently updated" width="820" />
   <br /><sub>Filter by status and drafts, pick an author, then sort by <b>Oldest</b> and back to <b>Recently updated</b>.</sub>

@@ -313,7 +313,7 @@ function harness() {
             assert.deepEqual(errors, []);
             assert.equal(threads.length, 3);
         },
-        async openWebview(aiReview) {
+        async openWebview(aiReview, onPullRequestChanged = () => {}) {
             const {PullRequestWebview} = load(
                 path.join(root, "views/pullRequestWebview.js"),
                 overrides,
@@ -329,7 +329,7 @@ function harness() {
                 repository,
                 api,
                 (error) => errors.push(error),
-                () => {},
+                onPullRequestChanged,
                 () => undefined,
                 async () => false,
                 {getProviderLabel: () => "Test"},
@@ -384,7 +384,13 @@ test("changed files switch between the default folder tree and a flat list witho
                     dispose() {}
                 },
                 Uri: {from: (uri) => uri},
-                ThemeIcon: {File: "file", Folder: "folder"},
+                ThemeIcon: class {
+                    static File = "file";
+                    static Folder = "folder";
+                    constructor(id) {
+                        this.id = id;
+                    }
+                },
             },
         },
     );
@@ -498,6 +504,11 @@ test("tree provider carries Bitbucket avatar URLs into the sorted author list an
             vscode: {
                 TreeItem: class {},
                 TreeItemCollapsibleState: {Collapsed: 1},
+                ThemeIcon: class {
+                    constructor(id) {
+                        this.id = id;
+                    }
+                },
                 EventEmitter: class {
                     fire() {}
                     dispose() {}
@@ -524,7 +535,10 @@ test("tree provider carries Bitbucket avatar URLs into the sorted author list an
         destination: {branch: {name: "main"}},
     }));
     const provider = new PullRequestTreeProvider(
-        () => ({listPullRequests: async () => pullRequests}),
+        () => ({
+            listPullRequests: async () => pullRequests,
+            getCurrentAccountId: async () => undefined,
+        }),
         () => repository,
         (error) => errors.push(error),
     );
@@ -624,6 +638,47 @@ test("new native comments immediately expose the delete action", async () => {
     assert.equal(comment.contextValue, "diffsparkOwnComment");
     await h.commands.get("bitbucketPrReviewer.deleteDiffComment")(comment);
     assert.deepEqual(h.deletions, [[repository, 42, 20]]);
+});
+
+test("review actions refresh the PR list after successful changes", async () => {
+    const h = harness();
+    let reviewState = "none";
+    let updates = 0;
+    h.api.getMyReviewState = async () => reviewState;
+    for (const [method, state] of [
+        ["approve", "approved"],
+        ["unapprove", "none"],
+        ["requestChanges", "changes_requested"],
+        ["removeChangeRequest", "none"],
+    ]) {
+        h.api[method] = async () => {
+            if (h.state.failure) throw h.state.failure;
+            reviewState = state;
+        };
+    }
+    h.overrides.vscode.window.showInformationMessage = async () => {};
+    h.overrides.vscode.window.showInputBox = async () => "";
+    const view = await h.openWebview(undefined, () => updates++);
+    h.state.choice = undefined;
+    await view.handleMessage({command: "approve"});
+    assert.equal(updates, 0, "cancelling does not update the list");
+    for (const [command, choice, state] of [
+        ["approve", "Approve", "approved"],
+        ["approve", "Unapprove", "none"],
+        ["requestChanges", undefined, "changes_requested"],
+        ["requestChanges", undefined, "none"],
+    ]) {
+        h.state.choice = choice;
+        const previous = updates;
+        await view.handleMessage({command});
+        assert.equal(updates, previous + 1);
+        assert.equal(view.reviewState, state);
+    }
+    h.state.choice = "Approve";
+    h.state.failure = new Error("Permission denied");
+    await view.handleMessage({command: "approve"});
+    assert.equal(updates, 4, "failed mutations do not update the list");
+    assert.match(h.errors[0].message, /Permission denied/);
 });
 
 test("webview exposes deletion, validates messages, and updates without reloading the composer", async () => {

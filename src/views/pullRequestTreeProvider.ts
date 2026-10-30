@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type {BitbucketClient} from "../bitbucket/client";
+import {getReviewState} from "../bitbucket/reviewState";
 import {buildFileTree, type FileTreeNode} from "../bitbucket/tree";
 import type {
     BitbucketRepository,
@@ -7,6 +8,7 @@ import type {
     PullRequest,
     PullRequestSort,
     PullRequestState,
+    ReviewState,
 } from "../bitbucket/types";
 
 type TreeNode = PullRequestNode | PathNode;
@@ -18,11 +20,46 @@ export interface PullRequestAuthor {
     avatarUrl?: string;
 }
 
+const REVIEW_PRESENTATION: Record<
+    ReviewState | "unavailable",
+    {label: string; icon: string; color?: string}
+> = {
+    approved: {
+        icon: "check",
+        label: "Approved by you",
+        color: "testing.iconPassed",
+    },
+    changes_requested: {
+        icon: "request-changes",
+        color: "list.warningForeground",
+        label: "Changes requested by you",
+    },
+    none: {
+        icon: "git-pull-request",
+        label: "No approval or change request from you",
+    },
+    unavailable: {
+        icon: "git-pull-request",
+        label: "Your review status is unavailable",
+    },
+};
+
 export class PullRequestNode extends vscode.TreeItem {
-    constructor(readonly pullRequest: PullRequest) {
+    constructor(
+        readonly pullRequest: PullRequest,
+        reviewState?: ReviewState,
+    ) {
         super(pullRequest.title, vscode.TreeItemCollapsibleState.Collapsed);
         this.description = `#${pullRequest.id} · ${pullRequest.draft ? "Draft · " : ""}${pullRequest.state}`;
-        this.tooltip = `${pullRequest.source.branch.name} → ${pullRequest.destination.branch.name}`;
+        const review = REVIEW_PRESENTATION[reviewState ?? "unavailable"];
+        this.iconPath = new vscode.ThemeIcon(
+            review.icon,
+            review.color ? new vscode.ThemeColor(review.color) : undefined,
+        );
+        this.tooltip = `${pullRequest.source.branch.name} → ${pullRequest.destination.branch.name}\n${review.label}`;
+        this.accessibilityInformation = {
+            label: `#${pullRequest.id} ${pullRequest.title}, ${pullRequest.draft ? "Draft, " : ""}${pullRequest.state}, ${review.label}`,
+        };
         this.contextValue = "bitbucketPullRequest";
         this.command = {
             command: "bitbucketPrReviewer.openPullRequest",
@@ -160,12 +197,19 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
             if (!repository) {
                 return [];
             }
-            const pullRequests = await this.getClient().listPullRequests(
-                repository,
-                this.states,
-                this.includeDrafts,
-                this.sort,
-            );
+            const client = this.getClient();
+            const [pullRequests, accountId] = await Promise.all([
+                client.listPullRequests(
+                    repository,
+                    this.states,
+                    this.includeDrafts,
+                    this.sort,
+                ),
+                client.getCurrentAccountId().catch((error: unknown) => {
+                    this.onError(error);
+                    return undefined;
+                }),
+            ]);
             this.loadedPullRequests = pullRequests;
             const authorId = this.author?.accountId;
             const visible = authorId
@@ -173,7 +217,13 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
                       (pullRequest) => pullRequest.author?.account_id === authorId,
                   )
                 : pullRequests;
-            return visible.map((pullRequest) => new PullRequestNode(pullRequest));
+            return visible.map(
+                (pullRequest) =>
+                    new PullRequestNode(
+                        pullRequest,
+                        accountId ? getReviewState(pullRequest, accountId) : undefined,
+                    ),
+            );
         } catch (error) {
             this.onError(error);
             return [];
