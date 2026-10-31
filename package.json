@@ -226,6 +226,12 @@
           "default": "",
           "markdownDescription": "Language of the **Review with AI** summary and comments, e.g. `Portuguese (Brazil)` or `English`. Leave empty to use the VS Code display language."
         },
+        "diffspark.ai.review.comments.includeHeader": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "markdownDescription": "Include the severity, category and title header in **Review with AI** comments. Disable to post only the explanation and suggested code. Also hides the verdict heading and severity labels in posted summaries."
+        },
         "diffspark.ai.review.minSeverity": {
           "type": "string",
           "enum": [

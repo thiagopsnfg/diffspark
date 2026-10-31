@@ -387,7 +387,7 @@ test("formats findings and the summary as Bitbucket Markdown", () => {
     const markdown = formatFindingComment(finding);
     assert.match(
         markdown,
-        /^\*\*🟠 Major · Team rule: Early return\*\* — Use an early return/,
+        /^\*\*Major · Team rule: Early return\*\* — Use an early return/,
     );
     assert.match(markdown, /```ts\nif \(!user\) return;\n```/);
     assert.match(
@@ -402,9 +402,54 @@ test("formats findings and the summary as Bitbucket Markdown", () => {
             {...finding, id: "b1-2", title: "Dismissed", status: "dismissed"},
         ],
     });
-    assert.match(summary, /^### ⛔ Changes needed\n\nOne problem\./);
-    assert.match(summary, /- \*\*🟠 Major\*\* `src\/math\.ts:7` — Use an early return/);
+    assert.match(summary, /^### Changes needed\n\nOne problem\./);
+    assert.match(summary, /- \*\*Major\*\* `src\/math\.ts:7` — Use an early return/);
     assert.doesNotMatch(summary, /Dismissed/);
+    assert.doesNotMatch(markdown + summary, /\p{Extended_Pictographic}/u);
+
+    const options = {includeHeader: false};
+    const plain = formatFindingComment(finding, options);
+    assert.equal(plain, "Nested ifs are hard to read.\n\n```ts\nif (!user) return;\n```");
+    assert.equal(
+        formatFindingComment(finding, {...options, includeLocation: true}),
+        "`src/math.ts:7`\n\n" + plain,
+    );
+    assert.equal(
+        formatFindingComment(
+            {...finding, body: finding.title, suggestion: undefined},
+            options,
+        ),
+        finding.title,
+    );
+    assert.equal(
+        formatFindingComment({...finding, body: "", suggestion: undefined}, options),
+        finding.title,
+    );
+    assert.equal(
+        formatFindingComment(
+            {...finding, line: undefined},
+            {...options, includeLocation: true},
+        ),
+        "`src/math.ts`\n\n" + plain,
+    );
+    assert.equal(
+        formatSummaryComment(
+            {
+                verdict: "request_changes",
+                summary: "One problem.",
+                findings: [finding, {...finding, status: "dismissed"}],
+            },
+            options,
+        ),
+        "One problem.\n\n- `src/math.ts:7` — Use an early return",
+    );
+    assert.equal(
+        formatSummaryComment(
+            {verdict: "approve", summary: "All good.", findings: []},
+            options,
+        ),
+        "All good.",
+    );
 });
 
 test("builds review prompts with team rules, language, focus and untrusted data markers", () => {
@@ -433,6 +478,7 @@ test("builds review prompts with team rules, language, focus and untrusted data 
     );
     assert.match(prompt.system, /Portuguese \(Brazil\)/);
     assert.match(prompt.system, /untrusted data/);
+    assert.match(prompt.system, /Do not add emojis/);
     assert.match(prompt.system, /"verdict": "approve" \| "comment" \| "request_changes"/);
     assert.match(prompt.user, /extra attention to: security, tests/);
     assert.match(prompt.user, /part 2 of 3/);
@@ -471,6 +517,7 @@ test("builds review prompts with team rules, language, focus and untrusted data 
         /\[b1-1\] major\/bug src\/math\.js:7 — Division by zero/,
     );
     assert.match(synthesis.system, /duplicates/);
+    assert.match(synthesis.system, /Do not add emojis/);
     assert.match(buildJsonRepairPrompt(prompt, "oops").user, /not valid JSON[\s\S]*oops/);
 });
 
