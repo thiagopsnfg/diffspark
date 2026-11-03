@@ -344,6 +344,12 @@ Issues and pull requests are welcome at [github.com/thiagopsnfg/diffspark](https
         <sub><b>Thiago P. Santos</b></sub>
       </a>
     </td>
+    <td align="center">
+      <a href="https://github.com/rrrovalle">
+        <img src="https://github.com/rrrovalle.png?size=100" width="80" alt="Thiago P. Santos" /><br />
+        <sub><b>Rodrigo R. Valle</b></sub>
+      </a>
+    </td>
   </tr>
 </table>
 
