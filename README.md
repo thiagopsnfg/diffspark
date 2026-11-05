@@ -216,6 +216,7 @@ Some reviewers navigate by folder; others just want the list of files. Choose wh
 - **Markdown everywhere** — description, comments, and threaded replies.
 - **Delete your own comments** (including replies) with the trash icon on hover. Deletion asks for confirmation, and placeholders keep replies intact.
 - **Approve**, **Request changes** (Bitbucket's native status, with an optional explanation), and **Merge** with your choice of strategy, commit message, and source-branch cleanup.
+- **Merge conflict alerts** — open PRs with conflicts show a banner above the description, and every conflicting file gets a ⚠ badge in the changed files list.
 
 ## Quick start
 
@@ -225,9 +226,9 @@ Some reviewers navigate by folder; others just want the list of files. Choose wh
 
    | Scope | Why it is needed |
    | --- | --- |
-   | `read:pullrequest:bitbucket` | List pull requests and read or write comments. |
+   | `read:pullrequest:bitbucket` | List pull requests, read comments, and start merge-conflict detection. |
    | `write:pullrequest:bitbucket` | Approve, request changes, and merge pull requests. |
-   | `read:repository:bitbucket` | List changed files (Bitbucket redirects the PR diffstat to the repository diffstat endpoint). |
+   | `read:repository:bitbucket` | List changed files and detect merge conflicts (Bitbucket redirects the PR diffstat and conflicts endpoints to repository endpoints). |
    | `write:repository:bitbucket` | Close the source branch after merging. |
    | `read:user:bitbucket` | Identify your account to show the delete icon only on your own comments and your current review state. |
 
@@ -289,6 +290,7 @@ Optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL (`*
 
 - Supports **Bitbucket Cloud** and **Jira Cloud** only (not Data Center/Server).
 - Draft filtering depends on the draft metadata returned by Bitbucket.
+- Merge conflict indicators rely on Bitbucket's file-conflicts API and are shown for open pull requests only.
 - Merges succeed only when Bitbucket permissions, branch policies, and repository state allow them.
 - Jira transition failures are reported after the merge; they do not undo it.
 

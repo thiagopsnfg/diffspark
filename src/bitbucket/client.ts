@@ -3,6 +3,7 @@ import type {
     ChangedFile,
     PullRequest,
     ReviewState,
+    FileConflict,
     MergeStrategy,
     RequestOptions,
     PullRequestPage,
@@ -135,6 +136,17 @@ export class BitbucketClient {
                   ]
                 : [];
         });
+    }
+
+    async getFileConflicts(
+        repository: BitbucketRepository,
+        pullRequestId: number,
+    ): Promise<FileConflict[]> {
+        const path = this.pullRequestPath(repository, pullRequestId, "/conflicts");
+        const conflicts = await this.getPaginated<FileConflict>(
+            new URL(path, API_ORIGIN).toString(),
+        );
+        return conflicts.filter((conflict) => Boolean(conflict.path));
     }
 
     /** Resolves the PR commits once so many files can be compared without re-fetching the PR and merge base. */

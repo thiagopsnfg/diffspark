@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import type {BitbucketClient} from "../bitbucket/client";
 import {getReviewState} from "../bitbucket/reviewState";
+import {markConflictedFiles} from "../bitbucket/conflicts";
 import {buildFileTree, type FileTreeNode} from "../bitbucket/tree";
 import type {
     BitbucketRepository,
     ChangedFile,
+    FileConflict,
     PullRequest,
     PullRequestSort,
     PullRequestState,
@@ -13,6 +15,9 @@ import type {
 
 type TreeNode = PullRequestNode | PathNode;
 export type FileLayout = "tree" | "list";
+
+const TREE_URI_SCHEME = "diffspark-tree";
+const CONFLICT_URI_QUERY = "conflict=1";
 
 export interface PullRequestAuthor {
     accountId: string;
@@ -85,11 +90,14 @@ class PathNode extends vscode.TreeItem {
                 ? vscode.TreeItemCollapsibleState.Collapsed
                 : vscode.TreeItemCollapsibleState.None,
         );
-        this.tooltip = fileNode.path;
+        const conflicted =
+            fileNode.kind === "file" && files.get(fileNode.path)?.conflicted === true;
+        this.tooltip = conflicted ? `${fileNode.path}\nMerge conflict` : fileNode.path;
         // resourceUri + ThemeIcon.File/Folder lets VS Code render icons from the active file icon theme.
         this.resourceUri = vscode.Uri.from({
-            scheme: "diffspark-tree",
+            scheme: TREE_URI_SCHEME,
             path: `/${repository.fullName}/${pullRequestId}/${fileNode.path}`,
+            ...(conflicted ? {query: CONFLICT_URI_QUERY} : {}),
         });
         this.iconPath =
             fileNode.kind === "directory"
@@ -102,6 +110,11 @@ class PathNode extends vscode.TreeItem {
         if (fileNode.kind === "file") {
             if (showPath && fileNode.path.includes("/")) {
                 this.description = `- ${fileNode.path.slice(0, fileNode.path.lastIndexOf("/"))}`;
+            }
+            if (conflicted) {
+                this.accessibilityInformation = {
+                    label: `${fileNode.path}, merge conflict`,
+                };
             }
             this.command = {
                 command: "bitbucketPrReviewer.openChangedFile",
@@ -118,7 +131,9 @@ class PathNode extends vscode.TreeItem {
     }
 }
 
-export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode> {
+export class PullRequestTreeProvider
+    implements vscode.TreeDataProvider<TreeNode>, vscode.FileDecorationProvider
+{
     private readonly changeEmitter = new vscode.EventEmitter<
         TreeNode | undefined | null
     >();
@@ -161,10 +176,12 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
                 if (!repository) {
                     return [];
                 }
-                const files = await this.getClient().getChangedFiles(
-                    repository,
-                    element.pullRequest.id,
-                );
+                const client = this.getClient();
+                const [changedFiles, conflicts] = await Promise.all([
+                    client.getChangedFiles(repository, element.pullRequest.id),
+                    this.loadConflicts(client, repository, element.pullRequest),
+                ]);
+                const files = markConflictedFiles(changedFiles, conflicts);
                 const fileTree = buildFileTree(files.map((file) => file.path));
                 const flattenFiles = (nodes: FileTreeNode[]): FileTreeNode[] =>
                     nodes.flatMap((node) =>
@@ -224,6 +241,33 @@ export class PullRequestTreeProvider implements vscode.TreeDataProvider<TreeNode
                         accountId ? getReviewState(pullRequest, accountId) : undefined,
                     ),
             );
+        } catch (error) {
+            this.onError(error);
+            return [];
+        }
+    }
+
+    provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
+        if (uri.scheme !== TREE_URI_SCHEME || uri.query !== CONFLICT_URI_QUERY) {
+            return undefined;
+        }
+        return new vscode.FileDecoration(
+            "⚠",
+            "Merge conflict",
+            new vscode.ThemeColor("list.warningForeground"),
+        );
+    }
+
+    private async loadConflicts(
+        client: BitbucketClient,
+        repository: BitbucketRepository,
+        pullRequest: PullRequest,
+    ): Promise<FileConflict[]> {
+        if (pullRequest.state !== "OPEN") {
+            return [];
+        }
+        try {
+            return await client.getFileConflicts(repository, pullRequest.id);
         } catch (error) {
             this.onError(error);
             return [];

@@ -14,8 +14,10 @@ treeModule.require = (id) =>
                       this.label = label;
                   }
               },
-              TreeItemCollapsibleState: {Collapsed: 1},
+              TreeItemCollapsibleState: {None: 0, Collapsed: 1},
               ThemeIcon: class {
+                  static File = "file";
+                  static Folder = "folder";
                   constructor(id, color) {
                       this.id = id;
                       this.color = color;
@@ -26,6 +28,12 @@ treeModule.require = (id) =>
                       this.id = id;
                   }
               },
+              FileDecoration: class {
+                  constructor(badge, tooltip, color) {
+                      Object.assign(this, {badge, tooltip, color});
+                  }
+              },
+              Uri: {from: (components) => components},
               EventEmitter: class {
                   event = () => {};
                   fire() {}
@@ -124,4 +132,107 @@ test("keeps PRs visible when the account identity is unavailable or fails", asyn
         assert.match(nodes[0].tooltip, /Your review status is unavailable/);
         assert.equal(errors.length, fails ? 1 : 0);
     }
+});
+
+test("marks conflicting files with a warning decoration in tree and list layouts", async () => {
+    const errors = [];
+    const conflictCalls = [];
+    const files = [
+        {path: "src/app.ts", status: "modified", newPath: "src/app.ts"},
+        {path: "README.md", status: "modified"},
+    ];
+    const {PullRequestTreeProvider, PullRequestNode} = treeModule.exports;
+    const provider = new PullRequestTreeProvider(
+        () => ({
+            getChangedFiles: async () => files,
+            getFileConflicts: async (...args) => {
+                conflictCalls.push(args);
+                return [{path: "src/app.ts", scenario: "content"}];
+            },
+        }),
+        () => repository,
+        (error) => errors.push(error),
+    );
+    const pr = new PullRequestNode({
+        id: 7,
+        title: "PR 7",
+        state: "OPEN",
+        source: {branch: {name: "feature"}},
+        destination: {branch: {name: "main"}},
+    });
+
+    const tree = await provider.getChildren(pr);
+    const src = tree.find((node) => node.label === "src");
+    const [treeFile] = await provider.getChildren(src);
+    assert.equal(treeFile.resourceUri.query, "conflict=1");
+
+    provider.setFileLayout("list");
+    const list = await provider.getChildren(pr);
+    const app = list.find((node) => node.label === "app.ts");
+    const readme = list.find((node) => node.label === "README.md");
+    assert.equal(app.resourceUri.query, "conflict=1");
+    assert.match(app.tooltip, /Merge conflict/);
+    assert.match(app.accessibilityInformation.label, /merge conflict/);
+    assert.equal(app.command.arguments[2].conflicted, true);
+    assert.equal(readme.resourceUri.query, undefined);
+    assert.equal(readme.tooltip, "README.md");
+    assert.equal(readme.command.arguments[2], files[1]);
+
+    const decoration = provider.provideFileDecoration(app.resourceUri);
+    assert.equal(decoration.badge, "⚠");
+    assert.equal(decoration.tooltip, "Merge conflict");
+    assert.equal(decoration.color.id, "list.warningForeground");
+    assert.equal(provider.provideFileDecoration(readme.resourceUri), undefined);
+    assert.equal(
+        provider.provideFileDecoration({scheme: "file", query: "conflict=1"}),
+        undefined,
+    );
+    assert.deepEqual(conflictCalls, [
+        [repository, 7],
+        [repository, 7],
+    ]);
+    assert.equal(files[0].conflicted, undefined);
+    assert.deepEqual(errors, []);
+    provider.dispose();
+});
+
+test("keeps changed files visible when conflict detection fails and skips closed PRs", async () => {
+    const errors = [];
+    const conflictCalls = [];
+    const {PullRequestTreeProvider, PullRequestNode} = treeModule.exports;
+    const pullRequest = {
+        id: 1,
+        title: "PR 1",
+        state: "OPEN",
+        source: {branch: {name: "feature"}},
+        destination: {branch: {name: "main"}},
+    };
+    const provider = new PullRequestTreeProvider(
+        () => ({
+            getChangedFiles: async () => [{path: "README.md", status: "modified"}],
+            getFileConflicts: async (_repository, id) => {
+                conflictCalls.push(id);
+                throw new Error("Conflicts unavailable");
+            },
+        }),
+        () => repository,
+        (error) => errors.push(error),
+    );
+
+    const open = await provider.getChildren(new PullRequestNode(pullRequest));
+    assert.deepEqual(
+        open.map((node) => node.label),
+        ["README.md"],
+    );
+    assert.equal(open[0].resourceUri.query, undefined);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].message, /Conflicts unavailable/);
+
+    const merged = await provider.getChildren(
+        new PullRequestNode({...pullRequest, id: 2, state: "MERGED"}),
+    );
+    assert.equal(merged.length, 1);
+    assert.deepEqual(conflictCalls, [1]);
+    assert.equal(errors.length, 1);
+    provider.dispose();
 });

@@ -5,6 +5,7 @@ import type {JiraClient, JiraTransition} from "../jira/client";
 import {renderMarkdown, sanitizeCommentHtml} from "./markdown";
 import type {
     BitbucketRepository,
+    FileConflict,
     MergeStrategy,
     PullRequest,
     PullRequestComment,
@@ -57,6 +58,7 @@ export class PullRequestWebview {
     private readonly availableTransitions = new Map<string, Set<string>>();
     private readonly panel: vscode.WebviewPanel;
     private comments: PullRequestComment[] = [];
+    private conflicts: FileConflict[] = [];
     private improveCancellation: vscode.CancellationTokenSource | undefined;
 
     private constructor(
@@ -198,14 +200,31 @@ export class PullRequestWebview {
     }
 
     private async refresh(): Promise<void> {
-        const [comments, reviewState] = await Promise.all([
+        const [comments, reviewState, conflicts] = await Promise.all([
             this.client.getComments(this.repository, this.pullRequest.id),
             this.client.getMyReviewState(this.repository, this.pullRequest.id),
+            this.loadConflicts(),
         ]);
         this.reviewState = reviewState;
         this.comments = comments.filter((comment) => !comment.deleted);
+        this.conflicts = conflicts;
         if (!this.disposed) {
             this.panel.webview.html = this.render(this.comments);
+        }
+    }
+
+    private async loadConflicts(): Promise<FileConflict[]> {
+        if (this.pullRequest.state !== "OPEN") {
+            return [];
+        }
+        try {
+            return await this.client.getFileConflicts(
+                this.repository,
+                this.pullRequest.id,
+            );
+        } catch (error) {
+            this.onError(error);
+            return this.conflicts;
         }
     }
 
@@ -605,6 +624,10 @@ export class PullRequestWebview {
             ? "status--draft"
             : `status--${this.pullRequest.state.toLowerCase()}`;
         const defaultCommitMessage = `Merged in ${this.pullRequest.source.branch.name} (pull request #${this.pullRequest.id})\n\n${this.pullRequest.title}`;
+        const mergeAlert =
+            this.conflicts.length > 0
+                ? `<div class="merge-alert" role="status"><span class="merge-alert-icon">${icon("warning")}</span><div><strong>This pull request can't be merged</strong><p>You will need to resolve conflicts to be able to merge.</p></div></div>`
+                : "";
         const renderedComments = comments
             .map((comment) => {
                 const rawMarkdown = comment.content?.raw ?? comment.content?.html ?? "";
@@ -756,6 +779,11 @@ export class PullRequestWebview {
     .ai-review-progress { display: flex; align-items: center; gap: .6rem; color: var(--vscode-descriptionForeground); }
     .ai-review-progress .shimmer { flex: 1 1 auto; margin: 0; }
     .ai-stale { padding: .45rem .65rem; border-left: 3px solid var(--vscode-editorWarning-foreground); background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 10%, transparent); font-size: .9em; }
+    .merge-alert { display: flex; align-items: flex-start; gap: .75rem; margin-top: 1.25rem; padding: .8rem 1rem; border: 1px solid color-mix(in srgb, var(--vscode-editorWarning-foreground) 45%, transparent); border-left: 4px solid var(--vscode-editorWarning-foreground); border-radius: 8px; background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 12%, transparent); }
+    .merge-alert-icon { flex: none; display: inline-flex; margin-top: .1rem; color: var(--vscode-editorWarning-foreground); }
+    .merge-alert-icon svg { width: 18px; height: 18px; }
+    .merge-alert strong { display: block; }
+    .merge-alert p { margin: .15rem 0 0; color: var(--vscode-descriptionForeground); font-size: .92em; }
     .verdict { display: inline-flex; align-items: center; padding: .2rem .65rem; border: 1px solid currentColor; border-radius: 999px; font-weight: 600; font-size: .9em; }
     .verdict--approve { color: var(--vscode-testing-iconPassed, #73c991); }
     .verdict--comment { color: var(--vscode-textLink-foreground); }
@@ -811,6 +839,7 @@ export class PullRequestWebview {
     </div>
   </section>
   ${this.aiReview ? `<section class="section ai-review-section"><div id="ai-review">${this.renderAiReview()}</div></section>` : ""}
+  ${mergeAlert}
   <section class="section">
     <div class="section-title"><h2>Description</h2></div>
     <div class="markdown">${description || '<p class="empty-state">No description provided.</p>'}</div>
@@ -1448,6 +1477,7 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
 }
 
 const ICON_PATHS: Record<string, string> = {
+    warning: '<path d="M8 2.2 14.6 13.8H1.4z"/><path d="M8 6.4v3.4M8 11.9h.01"/>',
     wand: '<path d="M2.5 13.5 10 6"/><path d="m9 5 2 2"/><path d="M12.5 1.5v3M11 3h3"/><path d="M5 1.5v2M4 2.5h2"/><path d="M13 9v2M12 10h2"/>',
     chevronDown: '<path d="m3.5 6 4.5 4.5L12.5 6"/>',
     chevronRight: '<path d="m6 3.5 4.5 4.5L6 12.5"/>',

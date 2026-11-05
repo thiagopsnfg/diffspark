@@ -83,6 +83,13 @@ export interface ChangedFile {
     status?: string;
     oldPath?: string;
     newPath?: string;
+    conflicted?: boolean;
+}
+
+export interface FileConflict {
+    path: string;
+    scenario?: string;
+    message?: string;
 }
 
 export interface PullRequestPage<T> {

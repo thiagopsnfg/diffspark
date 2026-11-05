@@ -197,7 +197,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
     treeView = tree;
     treeView.message = "Connect to Bitbucket to load pull requests.";
-    context.subscriptions.push(tree, provider);
+    context.subscriptions.push(
+        tree,
+        provider,
+        vscode.window.registerFileDecorationProvider(provider),
+    );
 
     const setAuthorFilter = (author: PullRequestAuthor | undefined): void => {
         tree.description = author ? `Author: ${author.displayName}` : undefined;

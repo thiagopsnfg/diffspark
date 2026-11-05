@@ -89,6 +89,7 @@ function harness() {
         failure: undefined,
         confirmations: 0,
         accountId: "me",
+        conflicts: [],
     };
     const authorFilter = {
         authors: [],
@@ -117,6 +118,7 @@ function harness() {
         getComments: async () => comments.map((comment) => ({...comment})),
         getMyReviewState: async () => "none",
         getCurrentAccountId: async () => state.accountId,
+        getFileConflicts: async () => state.conflicts,
         getFileComparison: async () => ({before: "old", after: "new"}),
         createComment: async () => ({id: 20, content: {raw: "New comment"}}),
         deleteComment: async (...args) => {
@@ -189,6 +191,7 @@ function harness() {
         window: {
             createOutputChannel: () => ({...disposable, appendLine() {}}),
             createTreeView: () => ({...disposable}),
+            registerFileDecorationProvider: () => disposable,
             createWebviewPanel: () => panel,
             showErrorMessage: (error) => errors.push(error),
             showQuickPick: async (items) => {
@@ -409,7 +412,10 @@ test("changed files switch between the default folder tree and a flat list witho
         destination: {branch: {name: "main"}},
     });
     const provider = new PullRequestTreeProvider(
-        () => ({getChangedFiles: async () => files}),
+        () => ({
+            getChangedFiles: async () => files,
+            getFileConflicts: async () => [],
+        }),
         () => repository,
         (error) => errors.push(error),
     );
@@ -715,6 +721,33 @@ test("webview exposes deletion, validates messages, and updates without reloadin
     );
     await view.handleMessage({command: "deleteComment", commentId: 10});
     assert.equal(h.deletions.length, 1);
+});
+
+test("webview alerts when an open pull request has merge conflicts", async () => {
+    const clean = harness();
+    await clean.openWebview();
+    assert.doesNotMatch(clean.panel.webview.html, /class="merge-alert"/);
+
+    const h = harness();
+    h.state.conflicts = [{path: "app.js", scenario: "content"}];
+    await h.openWebview();
+    const html = h.panel.webview.html;
+    assert.match(html, /This pull request can't be merged/);
+    assert.match(html, /You will need to resolve conflicts to be able to merge\./);
+    assert.ok(html.indexOf('class="merge-alert"') < html.indexOf("<h2>Description</h2>"));
+    assert.deepEqual(h.errors, []);
+});
+
+test("webview remains available when the conflict lookup fails", async () => {
+    const h = harness();
+    h.api.getFileConflicts = async () => {
+        throw new Error("Conflicts unavailable");
+    };
+    await h.openWebview();
+    assert.doesNotMatch(h.panel.webview.html, /class="merge-alert"/);
+    assert.match(h.panel.webview.html, /<h2>Description<\/h2>/);
+    assert.equal(h.errors.length, 1);
+    assert.match(h.errors[0].message, /Conflicts unavailable/);
 });
 
 test("webview renders the AI review section and validates AI review messages", async () => {

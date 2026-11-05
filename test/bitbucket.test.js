@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {buildFileTree} = require("../dist/bitbucket/tree");
 const {BitbucketClient} = require("../dist/bitbucket/client");
+const {markConflictedFiles} = require("../dist/bitbucket/conflicts");
 const {JiraClient} = require("../dist/jira/client");
 const {extractJiraIssueKeys} = require("../dist/jira/issues");
 const {parseBitbucketRemoteUrl} = require("../dist/bitbucket/repository");
@@ -401,6 +402,81 @@ test("follows the diffstat redirect to the repository diffstat endpoint", async 
         fake.calls[1].headers.Authorization,
         fake.calls[0].headers.Authorization,
     );
+});
+
+test("reads file conflicts through the PR conflicts redirect and pagination", async () => {
+    const redirectTarget =
+        "https://api.bitbucket.org/2.0/repositories/iptvplatform/iptv-dashboard/file-conflicts/abc%0Ddef";
+    const nextPage = `${redirectTarget}?page=2`;
+    const fake = fakeTransport([
+        {statusCode: 302, body: "", location: redirectTarget},
+        {
+            statusCode: 200,
+            body: JSON.stringify({
+                values: [
+                    {
+                        path: "src/app.ts",
+                        scenario: "content",
+                        message: "File modified in both source and destination",
+                    },
+                ],
+                next: nextPage,
+            }),
+        },
+        {
+            statusCode: 200,
+            body: JSON.stringify({values: [{path: "README.md"}, {scenario: "content"}]}),
+        },
+    ]);
+    const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+    assert.deepEqual(
+        (await client.getFileConflicts(repository, 42)).map(({path}) => path),
+        ["src/app.ts", "README.md"],
+    );
+    assert.equal(fake.calls.length, 3);
+    assert.equal(
+        new URL(fake.calls[0].url).pathname,
+        "/2.0/repositories/iptvplatform/iptv-dashboard/pullrequests/42/conflicts",
+    );
+    assert.equal(fake.calls[1].url, redirectTarget);
+    assert.equal(fake.calls[2].url, nextPage);
+});
+
+test("returns no file conflicts when the API reports an empty result", async () => {
+    const fake = fakeTransport([{statusCode: 200, body: JSON.stringify({values: []})}]);
+    const client = new BitbucketClient("dev@example.com", "token", fake.transport);
+
+    assert.deepEqual(await client.getFileConflicts(repository, 42), []);
+});
+
+test("marks changed files by current, new, or old path without mutating the input", () => {
+    const files = [
+        {path: "src/app.ts", status: "modified", newPath: "src/app.ts"},
+        {
+            path: "src/renamed.ts",
+            status: "renamed",
+            oldPath: "src/original.ts",
+            newPath: "src/renamed.ts",
+        },
+        {path: "README.md", status: "modified"},
+    ];
+
+    const marked = markConflictedFiles(files, [
+        {path: "src/app.ts"},
+        {path: "src/original.ts"},
+    ]);
+    assert.deepEqual(
+        marked.map(({path, conflicted}) => [path, conflicted]),
+        [
+            ["src/app.ts", true],
+            ["src/renamed.ts", true],
+            ["README.md", undefined],
+        ],
+    );
+    assert.equal(marked[2], files[2]);
+    assert.equal(files[0].conflicted, undefined);
+    assert.equal(markConflictedFiles(files, []), files);
 });
 
 test("resolves relative redirect locations against the Bitbucket API", async () => {
