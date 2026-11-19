@@ -664,7 +664,7 @@ test("nested changed files open a diff for their original repository and PR", as
                         this.label = label;
                     }
                 },
-                TreeItemCollapsibleState: {None: 0, Collapsed: 1},
+                TreeItemCollapsibleState: {None: 0, Collapsed: 1, Expanded: 2},
                 ThemeIcon: class {
                     static File = "file";
                     static Folder = "folder";

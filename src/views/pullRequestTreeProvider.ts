@@ -89,7 +89,7 @@ class PathNode extends vscode.TreeItem {
         super(
             fileNode.name,
             fileNode.kind === "directory"
-                ? vscode.TreeItemCollapsibleState.Collapsed
+                ? vscode.TreeItemCollapsibleState.Expanded
                 : vscode.TreeItemCollapsibleState.None,
         );
         const conflicted =

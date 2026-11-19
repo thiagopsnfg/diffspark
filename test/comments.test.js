@@ -384,7 +384,7 @@ test("changed files switch between the default folder tree and a flat list witho
                         Object.assign(this, {label, collapsibleState});
                     }
                 },
-                TreeItemCollapsibleState: {Collapsed: 1, None: 0},
+                TreeItemCollapsibleState: {Collapsed: 1, Expanded: 2, None: 0},
                 EventEmitter: class {
                     fire() {
                         refreshes++;
@@ -430,10 +430,15 @@ test("changed files switch between the default folder tree and a flat list witho
         tree.map((node) => node.label),
         ["new", "other", "src", "README.md"],
     );
+    assert.equal(pr.collapsibleState, 1);
     const src = tree.find((node) => node.label === "src");
     const sub = (await provider.getChildren(src))[0];
     const folder = (await provider.getChildren(sub))[0];
     const nestedFile = (await provider.getChildren(folder))[0];
+    assert.equal(src.collapsibleState, 2);
+    assert.equal(sub.collapsibleState, 2);
+    assert.equal(folder.collapsibleState, 2);
+    assert.equal(nestedFile.collapsibleState, 0);
     assert.equal(nestedFile.label, "text.js");
     assert.equal(nestedFile.description, undefined);
     provider.setFileLayout("list");
@@ -515,7 +520,7 @@ test("tree provider carries Bitbucket avatar URLs into the sorted author list an
         {
             vscode: {
                 TreeItem: class {},
-                TreeItemCollapsibleState: {Collapsed: 1},
+                TreeItemCollapsibleState: {Collapsed: 1, Expanded: 2},
                 ThemeIcon: class {
                     constructor(id) {
                         this.id = id;

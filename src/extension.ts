@@ -1699,7 +1699,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     [
                         {
                             label: "Tree",
-                            detail: "Nest changed files in folders",
+                            detail: "Nest changed files in folders expanded by default",
                             value: "tree" as const,
                         },
                         {

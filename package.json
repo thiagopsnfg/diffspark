@@ -190,7 +190,7 @@
             "list"
           ],
           "enumDescriptions": [
-            "Nest changed files in their repository folders.",
+            "Nest changed files in their repository folders, expanded by default.",
             "Show changed files in a flat list with their folder paths as text."
           ],
           "default": "tree",

@@ -10,11 +10,11 @@ treeModule.require = (id) =>
     id === "vscode"
         ? {
               TreeItem: class {
-                  constructor(label) {
-                      this.label = label;
+                  constructor(label, collapsibleState) {
+                      Object.assign(this, {label, collapsibleState});
                   }
               },
-              TreeItemCollapsibleState: {None: 0, Collapsed: 1},
+              TreeItemCollapsibleState: {None: 0, Collapsed: 1, Expanded: 2},
               ThemeIcon: class {
                   static File = "file";
                   static Folder = "folder";
@@ -164,7 +164,9 @@ test("marks conflicting files with a warning decoration in tree and list layouts
 
     const tree = await provider.getChildren(pr);
     const src = tree.find((node) => node.label === "src");
+    assert.equal(src.collapsibleState, 2);
     const [treeFile] = await provider.getChildren(src);
+    assert.equal(treeFile.collapsibleState, 0);
     assert.equal(treeFile.resourceUri.query, "conflict=1");
 
     provider.setFileLayout("list");

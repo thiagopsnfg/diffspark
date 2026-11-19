@@ -195,7 +195,7 @@ Some reviewers navigate by folder; others just want the list of files. Choose wh
 
 | Layout | Best for | Example |
 | --- | --- | --- |
-| **Tree** (default) | Understanding the shape of a change across modules | `src › components › castle › CastleCard.tsx` |
+| **Tree** (default) | Understanding the shape of a change across modules; folders start expanded | `src › components › castle › CastleCard.tsx` |
 | **List** | Scanning many files quickly | `CastleCard.tsx - src/components/castle` |
 
 <p align="center">
@@ -266,7 +266,7 @@ Optional. Run **DiffSpark: Connect Jira** and enter your Jira Cloud site URL (`*
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `diffspark.files.layout` | `tree` | Changed files layout: `tree` or `list`. |
+| `diffspark.files.layout` | `tree` | Changed files layout: `tree` (folders expanded by default) or `list`. |
 | `diffspark.ai.provider` | `copilot` | AI provider: `copilot`, `openai`, or `gemini`. |
 | `diffspark.ai.model` | `""` | Optional model override (Copilot model family or OpenAI/Gemini model name). |
 | `diffspark.ai.openaiBaseUrl` | `https://api.openai.com/v1` | Base URL for OpenAI-compatible endpoints (Azure OpenAI, OpenRouter, local servers…). |
