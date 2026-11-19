@@ -18,7 +18,31 @@ type TreeNode = PullRequestNode | PathNode;
 export type FileLayout = "tree" | "list";
 
 const TREE_URI_SCHEME = "diffspark-tree";
-const CONFLICT_URI_QUERY = "conflict=1";
+const FILE_STATUS_URI_QUERY = "status";
+const CONFLICT_URI_QUERY = "conflict";
+type FileChangeStatus = "added" | "removed";
+
+const FILE_CHANGE_PRESENTATION: Record<
+    FileChangeStatus,
+    {label: string; badge: string; color: string}
+> = {
+    added: {
+        label: "Added file",
+        badge: "A",
+        color: "gitDecoration.addedResourceForeground",
+    },
+    removed: {
+        label: "Removed file",
+        badge: "D",
+        color: "gitDecoration.deletedResourceForeground",
+    },
+};
+
+function getFileChangeStatus(
+    status: string | null | undefined,
+): FileChangeStatus | undefined {
+    return status === "added" || status === "removed" ? status : undefined;
+}
 
 export interface PullRequestAuthor {
     accountId: string;
@@ -95,22 +119,34 @@ class PathNode extends vscode.TreeItem {
         const conflicted =
             fileNode.kind === "file" && files.get(fileNode.path)?.conflicted === true;
         const file = files.get(fileNode.path);
+        const changeStatus = getFileChangeStatus(file?.status);
+        const changePresentation = changeStatus
+            ? FILE_CHANGE_PRESENTATION[changeStatus]
+            : undefined;
         const hasComments =
             fileNode.kind === "file" &&
             file !== undefined &&
             [file.path, file.newPath, file.oldPath].some(
                 (path) => path !== undefined && commentedPaths.has(path),
             );
-        const status = [
+        const details = [
+            ...(changePresentation ? [changePresentation.label] : []),
             ...(hasComments ? ["Has comments"] : []),
             ...(conflicted ? ["Merge conflict"] : []),
         ];
-        this.tooltip = [fileNode.path, ...status].join("\n");
+        this.tooltip = [fileNode.path, ...details].join("\n");
         // resourceUri + ThemeIcon.File/Folder lets VS Code render icons from the active file icon theme.
+        const resourceQuery = new URLSearchParams();
+        if (changeStatus) {
+            resourceQuery.set(FILE_STATUS_URI_QUERY, changeStatus);
+        }
+        if (conflicted) {
+            resourceQuery.set(CONFLICT_URI_QUERY, "1");
+        }
         this.resourceUri = vscode.Uri.from({
             scheme: TREE_URI_SCHEME,
             path: `/${repository.fullName}/${pullRequestId}/${fileNode.path}`,
-            ...(conflicted ? {query: CONFLICT_URI_QUERY} : {}),
+            ...(resourceQuery.size > 0 ? {query: resourceQuery.toString()} : {}),
         });
         this.iconPath =
             fileNode.kind === "directory"
@@ -126,9 +162,9 @@ class PathNode extends vscode.TreeItem {
             if (showPath && fileNode.path.includes("/")) {
                 this.description = `- ${fileNode.path.slice(0, fileNode.path.lastIndexOf("/"))}`;
             }
-            if (status.length > 0) {
+            if (details.length > 0) {
                 this.accessibilityInformation = {
-                    label: `${fileNode.path}, ${status.join(", ").toLowerCase()}`,
+                    label: `${fileNode.path}, ${details.join(", ").toLowerCase()}`,
                 };
             }
             this.command = {
@@ -266,7 +302,23 @@ export class PullRequestTreeProvider
     }
 
     provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-        if (uri.scheme !== TREE_URI_SCHEME || uri.query !== CONFLICT_URI_QUERY) {
+        if (uri.scheme !== TREE_URI_SCHEME) {
+            return undefined;
+        }
+        const query = new URLSearchParams(uri.query);
+        const changeStatus = getFileChangeStatus(query.get(FILE_STATUS_URI_QUERY));
+        const conflicted = query.get(CONFLICT_URI_QUERY) === "1";
+        if (changeStatus) {
+            const presentation = FILE_CHANGE_PRESENTATION[changeStatus];
+            return new vscode.FileDecoration(
+                conflicted ? `${presentation.badge}⚠` : presentation.badge,
+                conflicted
+                    ? `${presentation.label} · Merge conflict`
+                    : presentation.label,
+                new vscode.ThemeColor(presentation.color),
+            );
+        }
+        if (!conflicted) {
             return undefined;
         }
         return new vscode.FileDecoration(

@@ -198,6 +198,8 @@ Some reviewers navigate by folder; others just want the list of files. Choose wh
 | **Tree** (default) | Understanding the shape of a change across modules; folders start expanded | `src › components › castle › CastleCard.tsx` |
 | **List** | Scanning many files quickly | `CastleCard.tsx - src/components/castle` |
 
+In either layout, newly added files show a green **A** badge and removed files show a red **D** badge. Hover over a file for its change status, and screen readers announce the same detail.
+
 <p align="center">
   <img src="images/file-layout.gif" alt="Switching changed files from tree to list layout" width="820" />
 </p>

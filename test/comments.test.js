@@ -455,6 +455,9 @@ test("changed files switch between the default folder tree and a flat list witho
         ],
     );
     for (const node of list) {
+        const file = files.find(
+            (candidate) => node.resourceUri.path === `/team/repo/42/${candidate.path}`,
+        );
         assert.equal(node.collapsibleState, 0);
         assert.equal(node.iconPath, "file");
         assert.equal(node.contextValue, "bitbucketChangedFile");
@@ -463,7 +466,7 @@ test("changed files switch between the default folder tree and a flat list witho
         assert.deepEqual(node.command.arguments, [
             repository,
             42,
-            files.find((file) => file.path === node.tooltip),
+            file,
             "feature",
             "fork/repo",
         ]);

@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - **Merge conflict alerts**: open pull requests with conflicts show a banner above the description, and each conflicting file is marked with a ⚠ badge in the changed files list.
+- **File change badges**: newly added files show a green `A` badge and removed files show a red `D` badge in tree and list layouts.
 
 ## [0.1.0] - 2026-10-29
 

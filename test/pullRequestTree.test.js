@@ -199,6 +199,71 @@ test("marks conflicting files with a warning decoration in tree and list layouts
     provider.dispose();
 });
 
+test("marks added and removed files in tree and list layouts", async () => {
+    const errors = [];
+    const files = [
+        {path: "src/new.ts", status: "added", newPath: "src/new.ts"},
+        {path: "src/old.ts", status: "removed", oldPath: "src/old.ts"},
+        {path: "README.md", status: "modified", newPath: "README.md"},
+    ];
+    const {PullRequestTreeProvider, PullRequestNode} = treeModule.exports;
+    const provider = new PullRequestTreeProvider(
+        () => ({
+            getChangedFiles: async () => files,
+            getComments: async () => [],
+            getFileConflicts: async () => [{path: "src/old.ts"}],
+        }),
+        () => repository,
+        (error) => errors.push(error),
+    );
+    const pr = new PullRequestNode({
+        id: 9,
+        title: "PR 9",
+        state: "OPEN",
+        source: {branch: {name: "feature"}},
+        destination: {branch: {name: "main"}},
+    });
+
+    for (const layout of ["tree", "list"]) {
+        provider.setFileLayout(layout);
+        const nodes = await provider.getChildren(pr);
+        const fileNodes =
+            layout === "tree"
+                ? await provider.getChildren(nodes.find((node) => node.label === "src"))
+                : nodes;
+        const visibleFiles = layout === "tree" ? fileNodes.concat(nodes) : fileNodes;
+        const added = visibleFiles.find((node) => node.label === "new.ts");
+        const removed = visibleFiles.find((node) => node.label === "old.ts");
+        const modified = visibleFiles.find((node) => node.label === "README.md");
+
+        const addedDecoration = provider.provideFileDecoration(added.resourceUri);
+        assert.equal(addedDecoration.badge, "A");
+        assert.equal(addedDecoration.tooltip, "Added file");
+        assert.equal(addedDecoration.color.id, "gitDecoration.addedResourceForeground");
+        assert.equal(added.resourceUri.query, "status=added");
+        assert.match(added.tooltip, /Added file/);
+        assert.match(added.accessibilityInformation.label, /added file/);
+
+        const removedDecoration = provider.provideFileDecoration(removed.resourceUri);
+        assert.equal(removedDecoration.badge, "D⚠");
+        assert.equal(removedDecoration.tooltip, "Removed file · Merge conflict");
+        assert.equal(
+            removedDecoration.color.id,
+            "gitDecoration.deletedResourceForeground",
+        );
+        assert.equal(removed.resourceUri.query, "status=removed&conflict=1");
+        assert.match(removed.tooltip, /Removed file/);
+        assert.match(removed.tooltip, /Merge conflict/);
+        assert.match(removed.accessibilityInformation.label, /removed file/);
+
+        assert.equal(provider.provideFileDecoration(modified.resourceUri), undefined);
+        assert.equal(modified.resourceUri.query, undefined);
+        assert.equal(modified.tooltip, "README.md");
+    }
+    assert.deepEqual(errors, []);
+    provider.dispose();
+});
+
 test("marks files with live comments, including replies and renamed paths", async () => {
     const errors = [];
     const files = [
