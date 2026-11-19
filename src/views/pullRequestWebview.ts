@@ -1,33 +1,34 @@
 import * as vscode from "vscode";
-import type {BitbucketClient} from "../bitbucket/client";
+import type {CommentImprover} from "../ai/service";
 import {extractJiraIssueKeys} from "../jira/issues";
+import type {AiReviewState} from "../ai/review/runner";
+import type {BitbucketClient} from "../bitbucket/client";
 import type {JiraClient, JiraTransition} from "../jira/client";
 import {renderMarkdown, sanitizeCommentHtml} from "./markdown";
+import {categoryLabel, VERDICT_LABELS, SEVERITY_LABELS} from "../ai/review/parse";
+import {getCommentLocations, findChangedFileForLocation} from "../bitbucket/comments";
+import {
+    REVIEW_SEVERITIES,
+    type FindingStatus,
+    type AiReviewFinding,
+} from "../ai/review/types";
 import type {
-    BitbucketRepository,
+    PullRequest,
+    ReviewState,
     FileConflict,
     MergeStrategy,
-    PullRequest,
     PullRequestComment,
-    ReviewState,
+    BitbucketRepository,
 } from "../bitbucket/types";
-import type {CommentImprover} from "../ai/service";
 import {
-    describeImproveOptions,
-    IMPROVE_ACTIONS,
     IMPROVE_TONES,
-    type ImproveOptions,
-    isImproveAction,
     isImproveTone,
+    IMPROVE_ACTIONS,
+    isImproveAction,
     TRANSLATE_LANGUAGES,
+    type ImproveOptions,
+    describeImproveOptions,
 } from "../ai/prompt";
-import type {AiReviewState} from "../ai/review/runner";
-import {
-    type AiReviewFinding,
-    type FindingStatus,
-    REVIEW_SEVERITIES,
-} from "../ai/review/types";
-import {categoryLabel, SEVERITY_LABELS, VERDICT_LABELS} from "../ai/review/parse";
 
 /** Bridge between the pull request view and the AI reviewer (implemented in extension.ts). */
 export interface AiReviewHost {
@@ -58,6 +59,10 @@ export class PullRequestWebview {
     private readonly availableTransitions = new Map<string, Set<string>>();
     private readonly panel: vscode.WebviewPanel;
     private comments: PullRequestComment[] = [];
+    private commentLocations = new Map<
+        number,
+        NonNullable<PullRequestComment["inline"]>
+    >();
     private conflicts: FileConflict[] = [];
     private improveCancellation: vscode.CancellationTokenSource | undefined;
 
@@ -192,6 +197,7 @@ export class PullRequestWebview {
             case "post":
                 try {
                     await host.postFindings(message.ids);
+                    this.onPullRequestChanged();
                 } finally {
                     await this.refresh();
                 }
@@ -206,6 +212,7 @@ export class PullRequestWebview {
             this.loadConflicts(),
         ]);
         this.reviewState = reviewState;
+        this.commentLocations = getCommentLocations(comments);
         this.comments = comments.filter((comment) => !comment.deleted);
         this.conflicts = conflicts;
         if (!this.disposed) {
@@ -226,6 +233,33 @@ export class PullRequestWebview {
             this.onError(error);
             return this.conflicts;
         }
+    }
+
+    private async openCommentFile(commentId: number): Promise<void> {
+        if (!this.comments.some((comment) => comment.id === commentId)) {
+            throw new Error("This pull request comment is no longer available.");
+        }
+        const location = this.commentLocations.get(commentId);
+        if (!location) {
+            throw new Error("This comment is not attached to a changed file.");
+        }
+        const files = await this.client.getChangedFiles(
+            this.repository,
+            this.pullRequest.id,
+        );
+        const file = findChangedFileForLocation(files, location);
+        if (!file) {
+            throw new Error(`${location.path} is no longer part of this pull request.`);
+        }
+        await vscode.commands.executeCommand(
+            "bitbucketPrReviewer.openChangedFile",
+            this.repository,
+            this.pullRequest.id,
+            file,
+            this.pullRequest.source.branch.name,
+            this.pullRequest.source.repository?.full_name,
+            location.to,
+        );
     }
 
     private async improveComment(
@@ -376,6 +410,11 @@ export class PullRequestWebview {
                 return;
             }
 
+            if (message.command === "openCommentFile") {
+                await this.openCommentFile(message.commentId);
+                return;
+            }
+
             if (message.command === "deleteComment") {
                 const comment = this.comments.find(
                     (entry) => entry.id === message.commentId && !entry.deleted,
@@ -401,6 +440,7 @@ export class PullRequestWebview {
                         command: "commentDeleted",
                         commentId: comment.id,
                     });
+                    this.onPullRequestChanged();
                 }
                 return;
             }
@@ -417,6 +457,7 @@ export class PullRequestWebview {
                     message.command === "reply" ? message.parentId : undefined,
                 );
                 await this.refresh();
+                this.onPullRequestChanged();
                 return;
             }
         } catch (error) {
@@ -640,7 +681,17 @@ export class PullRequestWebview {
                         ? `<button class="secondary reply" data-parent="${comment.id}">Reply</button>`
                         : "";
                 const deleteControl = `<button class="secondary delete-comment" data-comment-id="${comment.id}" aria-label="Delete comment">Delete</button>`;
-                return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
+                const location = this.commentLocations.get(comment.id);
+                const line = location?.to ?? location?.from;
+                const locationLabel =
+                    location === undefined
+                        ? ""
+                        : `${location.path}${line === undefined ? "" : `:${line}`}`;
+                const fileLink =
+                    location === undefined
+                        ? ""
+                        : `<a href="#comment-${comment.id}" class="comment-file" data-comment-id="${comment.id}" title="Open ${escapeHtml(locationLabel)}">${icon("code")}<span>${escapeHtml(locationLabel)}</span></a>`;
+                return `<article class="comment" id="comment-${comment.id}"${parentId === undefined ? "" : ' data-reply="true"'}><header><div class="comment-heading"><strong>${escapeHtml(comment.user?.display_name ?? "Unknown user")}</strong>${fileLink}</div><span>${escapeHtml(formatDate(comment.created_on))}</span></header><div class="markdown">${content}</div><div class="actions">${replyControl}${deleteControl}</div></article>`;
             })
             .join("");
 
@@ -675,7 +726,12 @@ export class PullRequestWebview {
     .actions { gap: .6rem; }
     .comment { margin: .85rem 0 0; padding: .9rem 1rem; border: 1px solid var(--vscode-panel-border); border-radius: 6px; background: var(--vscode-editor-background); }
     .comment[data-reply="true"] { margin-left: 1.5rem; }
-    .comment header { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .6rem; }
+    .comment header { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; margin-bottom: .6rem; }
+    .comment-heading { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; gap: .2rem; }
+    .comment-file { display: inline-flex; align-items: center; max-width: 100%; gap: .3rem; color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); font-size: .88em; text-decoration: none; }
+    .comment-file:hover { text-decoration: underline; }
+    .comment-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .comment-file svg { flex: none; width: 14px; height: 14px; }
     .markdown { overflow-wrap: anywhere; }
     .markdown > :first-child { margin-top: 0; }
     .markdown > :last-child { margin-bottom: 0; }
@@ -926,6 +982,10 @@ export class PullRequestWebview {
     let replyTo;
     document.querySelectorAll(".delete-comment").forEach((button) => button.addEventListener("click", () => {
       vscode.postMessage({ command: "deleteComment", commentId: Number(button.dataset.commentId) });
+    }));
+    document.querySelectorAll(".comment-file").forEach((link) => link.addEventListener("click", (event) => {
+      event.preventDefault();
+      vscode.postMessage({ command: "openCommentFile", commentId: Number(link.dataset.commentId) });
     }));
     document.querySelectorAll(".reply").forEach((button) => button.addEventListener("click", () => {
       replyTo = Number(button.dataset.parent);
@@ -1359,6 +1419,7 @@ export class PullRequestWebview {
 
 type WebviewMessage =
     | {command: "deleteComment"; commentId: number}
+    | {command: "openCommentFile"; commentId: number}
     | {command: "comment"; markdown: string}
     | {command: "reply"; markdown: string; parentId: number}
     | {command: "approve"}
@@ -1398,7 +1459,10 @@ function isWebviewMessage(message: unknown): message is WebviewMessage {
         return false;
     }
     const candidate = message as Record<string, unknown>;
-    if (candidate.command === "deleteComment") {
+    if (
+        candidate.command === "deleteComment" ||
+        candidate.command === "openCommentFile"
+    ) {
         return (
             Number.isSafeInteger(candidate.commentId) && Number(candidate.commentId) > 0
         );

@@ -1,16 +1,17 @@
 import * as vscode from "vscode";
-import type {BitbucketClient} from "../bitbucket/client";
+import {getCommentedPaths} from "../bitbucket/comments";
 import {getReviewState} from "../bitbucket/reviewState";
+import type {BitbucketClient} from "../bitbucket/client";
 import {markConflictedFiles} from "../bitbucket/conflicts";
 import {buildFileTree, type FileTreeNode} from "../bitbucket/tree";
 import type {
-    BitbucketRepository,
     ChangedFile,
-    FileConflict,
     PullRequest,
+    ReviewState,
+    FileConflict,
     PullRequestSort,
     PullRequestState,
-    ReviewState,
+    BitbucketRepository,
 } from "../bitbucket/types";
 
 type TreeNode = PullRequestNode | PathNode;
@@ -81,6 +82,7 @@ class PathNode extends vscode.TreeItem {
         readonly pullRequestId: number,
         readonly files: Map<string, ChangedFile>,
         readonly sourceBranch: string,
+        readonly commentedPaths: ReadonlySet<string>,
         readonly sourceRepositoryFullName?: string,
         showPath = false,
     ) {
@@ -92,7 +94,18 @@ class PathNode extends vscode.TreeItem {
         );
         const conflicted =
             fileNode.kind === "file" && files.get(fileNode.path)?.conflicted === true;
-        this.tooltip = conflicted ? `${fileNode.path}\nMerge conflict` : fileNode.path;
+        const file = files.get(fileNode.path);
+        const hasComments =
+            fileNode.kind === "file" &&
+            file !== undefined &&
+            [file.path, file.newPath, file.oldPath].some(
+                (path) => path !== undefined && commentedPaths.has(path),
+            );
+        const status = [
+            ...(hasComments ? ["Has comments"] : []),
+            ...(conflicted ? ["Merge conflict"] : []),
+        ];
+        this.tooltip = [fileNode.path, ...status].join("\n");
         // resourceUri + ThemeIcon.File/Folder lets VS Code render icons from the active file icon theme.
         this.resourceUri = vscode.Uri.from({
             scheme: TREE_URI_SCHEME,
@@ -102,7 +115,9 @@ class PathNode extends vscode.TreeItem {
         this.iconPath =
             fileNode.kind === "directory"
                 ? vscode.ThemeIcon.Folder
-                : vscode.ThemeIcon.File;
+                : hasComments
+                  ? new vscode.ThemeIcon("comment-discussion")
+                  : vscode.ThemeIcon.File;
         this.contextValue =
             fileNode.kind === "directory"
                 ? "bitbucketChangedFolder"
@@ -111,9 +126,9 @@ class PathNode extends vscode.TreeItem {
             if (showPath && fileNode.path.includes("/")) {
                 this.description = `- ${fileNode.path.slice(0, fileNode.path.lastIndexOf("/"))}`;
             }
-            if (conflicted) {
+            if (status.length > 0) {
                 this.accessibilityInformation = {
-                    label: `${fileNode.path}, merge conflict`,
+                    label: `${fileNode.path}, ${status.join(", ").toLowerCase()}`,
                 };
             }
             this.command = {
@@ -165,6 +180,7 @@ export class PullRequestTreeProvider
                         element.pullRequestId,
                         element.files,
                         element.sourceBranch,
+                        element.commentedPaths,
                         element.sourceRepositoryFullName,
                     ),
             );
@@ -177,9 +193,10 @@ export class PullRequestTreeProvider
                     return [];
                 }
                 const client = this.getClient();
-                const [changedFiles, conflicts] = await Promise.all([
+                const [changedFiles, conflicts, commentedPaths] = await Promise.all([
                     client.getChangedFiles(repository, element.pullRequest.id),
                     this.loadConflicts(client, repository, element.pullRequest),
+                    this.loadCommentedPaths(client, repository, element.pullRequest.id),
                 ]);
                 const files = markConflictedFiles(changedFiles, conflicts);
                 const fileTree = buildFileTree(files.map((file) => file.path));
@@ -204,6 +221,7 @@ export class PullRequestTreeProvider
                             element.pullRequest.id,
                             filesByPath,
                             element.pullRequest.source.branch.name,
+                            commentedPaths,
                             element.pullRequest.source.repository?.full_name,
                             this.fileLayout === "list",
                         ),
@@ -271,6 +289,19 @@ export class PullRequestTreeProvider
         } catch (error) {
             this.onError(error);
             return [];
+        }
+    }
+
+    private async loadCommentedPaths(
+        client: BitbucketClient,
+        repository: BitbucketRepository,
+        pullRequestId: number,
+    ): Promise<Set<string>> {
+        try {
+            return getCommentedPaths(await client.getComments(repository, pullRequestId));
+        } catch (error) {
+            this.onError(error);
+            return new Set();
         }
     }
 

@@ -211,7 +211,7 @@ Some reviewers navigate by folder; others just want the list of files. Choose wh
 </p>
 
 - **Native side-by-side diffs** between the common ancestor and the PR source commit — including added, removed, renamed, and fork files.
-- **Inline comments** on changed lines, with existing discussions shown right in the diff.
+- **Inline comments** on changed lines, with existing discussions shown right in the diff. The PR overview links every inline discussion to its file, and the changed-files list shows a discussion icon for files with comments.
 - **Open the real file** from your checkout, or check out the PR source branch from the diff toolbar. DiffSpark warns before touching a dirty worktree; fork branches require the fork as a Git remote.
 - **Markdown everywhere** — description, comments, and threaded replies.
 - **Delete your own comments** (including replies) with the trash icon on hover. Deletion asks for confirmation, and placeholders keep replies intact.

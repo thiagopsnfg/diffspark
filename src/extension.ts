@@ -1,6 +1,22 @@
+import * as vscode from "vscode";
+import {JiraClient} from "./jira/client";
+import {CommentImprover} from "./ai/service";
+import {BitbucketClient} from "./bitbucket/client";
+import {pickImproveOptions} from "./ai/actionPicker";
+import type {AiReviewFinding} from "./ai/review/types";
+import {AiReviewer, aiReviewKey} from "./ai/review/runner";
+import type {AiReviewHost} from "./views/pullRequestWebview";
+import {PullRequestWebview} from "./views/pullRequestWebview";
+import {parseBitbucketRemoteUrl} from "./bitbucket/repository";
+import {buildCodeSnippet, type ImproveOptions, describeImproveOptions} from "./ai/prompt";
+import {
+    type FileLayout,
+    type PullRequestAuthor,
+    PullRequestTreeProvider,
+} from "./views/pullRequestTreeProvider";
 import type {
-    PullRequest,
     ChangedFile,
+    PullRequest,
     PullRequestState,
     PullRequestComment,
     BitbucketRepository,
@@ -12,23 +28,6 @@ import {
     formatSummaryComment,
     type ReviewCommentOptions,
 } from "./ai/review/parse";
-import * as vscode from "vscode";
-import {JiraClient} from "./jira/client";
-import {CommentImprover} from "./ai/service";
-import {BitbucketClient} from "./bitbucket/client";
-import {pickImproveOptions} from "./ai/actionPicker";
-import type {AiReviewFinding} from "./ai/review/types";
-import {AiReviewer, aiReviewKey} from "./ai/review/runner";
-import type {AiReviewHost} from "./views/pullRequestWebview";
-import {PullRequestWebview} from "./views/pullRequestWebview";
-import {parseBitbucketRemoteUrl} from "./bitbucket/repository";
-import {buildCodeSnippet, describeImproveOptions, type ImproveOptions} from "./ai/prompt";
-
-import {
-    type FileLayout,
-    type PullRequestAuthor,
-    PullRequestTreeProvider,
-} from "./views/pullRequestTreeProvider";
 
 const EMAIL_SECRET = "bitbucket-pr-reviewer.email";
 const TOKEN_SECRET = "bitbucket-pr-reviewer.api-token";
@@ -727,6 +726,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const posted = thread.comments.filter((comment) => !isAiComment(comment));
         const drafts = thread.comments.filter(isAiComment);
         thread.comments = [...posted, toDiffComment(created, thread, true), ...drafts];
+        provider.refresh();
         return true;
     };
 
@@ -1254,6 +1254,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     } else {
                         comment.thread.comments = remaining;
                     }
+                    provider.refresh();
                 }),
         ),
         vscode.commands.registerCommand(

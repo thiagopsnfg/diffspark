@@ -1,9 +1,9 @@
-const test = require("node:test");
-const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const path = require("node:path");
-const Module = require("node:module");
 const vm = require("node:vm");
+const path = require("node:path");
+const test = require("node:test");
+const Module = require("node:module");
+const assert = require("node:assert/strict");
 
 const root = path.resolve(__dirname, "../dist");
 const repository = {workspace: "team", slug: "repo", fullName: "team/repo"};
@@ -79,6 +79,7 @@ function load(filename, overrides, cache = new Map()) {
 
 function harness() {
     const commands = new Map();
+    const executedCommands = [];
     const threads = [];
     const errors = [];
     const deletions = [];
@@ -118,6 +119,7 @@ function harness() {
         getComments: async () => comments.map((comment) => ({...comment})),
         getMyReviewState: async () => "none",
         getCurrentAccountId: async () => state.accountId,
+        getChangedFiles: async () => [{path: "app.js"}],
         getFileConflicts: async () => state.conflicts,
         getFileComparison: async () => ({before: "old", after: "new"}),
         createComment: async () => ({id: 20, content: {raw: "New comment"}}),
@@ -168,7 +170,9 @@ function harness() {
                 commands.set(id, callback);
                 return disposable;
             },
-            executeCommand: async () => {},
+            executeCommand: async (...args) => {
+                executedCommands.push(args);
+            },
         },
         comments: {
             createCommentController: () => ({
@@ -282,6 +286,7 @@ function harness() {
     return {
         api,
         commands,
+        executedCommands,
         threads,
         errors,
         deletions,
@@ -415,6 +420,7 @@ test("changed files switch between the default folder tree and a flat list witho
         () => ({
             getChangedFiles: async () => files,
             getFileConflicts: async () => [],
+            getComments: async () => [],
         }),
         () => repository,
         (error) => errors.push(error),
@@ -721,6 +727,34 @@ test("webview exposes deletion, validates messages, and updates without reloadin
     );
     await view.handleMessage({command: "deleteComment", commentId: 10});
     assert.equal(h.deletions.length, 1);
+});
+
+test("webview links inline comments and replies to their changed file", async () => {
+    const h = harness();
+    const view = await h.openWebview();
+    const html = h.panel.webview.html;
+    assert.match(html, /class="comment-file" data-comment-id="10"/);
+    assert.match(html, /class="comment-file" data-comment-id="11"/);
+    assert.match(html, /app\.js:1/);
+    assert.match(html, /class="comment-file" data-comment-id="15"[^>]*>[^<]*<svg/);
+    assert.match(html, /app\.js:3/);
+
+    await view.handleMessage({command: "openCommentFile", commentId: 11});
+    assert.deepEqual(h.executedCommands, [
+        [
+            "bitbucketPrReviewer.openChangedFile",
+            repository,
+            42,
+            {path: "app.js"},
+            "feature",
+            undefined,
+            1,
+        ],
+    ]);
+
+    await view.handleMessage({command: "openCommentFile", commentId: 18});
+    await view.handleMessage({command: "openCommentFile", commentId: "10"});
+    assert.equal(h.errors.length, 2);
 });
 
 test("webview alerts when an open pull request has merge conflicts", async () => {

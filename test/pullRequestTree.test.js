@@ -1,7 +1,7 @@
-const test = require("node:test");
-const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const test = require("node:test");
 const Module = require("node:module");
+const assert = require("node:assert/strict");
 
 const filename = require.resolve("../dist/views/pullRequestTreeProvider");
 const treeModule = new Module(filename);
@@ -145,6 +145,7 @@ test("marks conflicting files with a warning decoration in tree and list layouts
     const provider = new PullRequestTreeProvider(
         () => ({
             getChangedFiles: async () => files,
+            getComments: async () => [],
             getFileConflicts: async (...args) => {
                 conflictCalls.push(args);
                 return [{path: "src/app.ts", scenario: "content"}];
@@ -196,6 +197,64 @@ test("marks conflicting files with a warning decoration in tree and list layouts
     provider.dispose();
 });
 
+test("marks files with live comments, including replies and renamed paths", async () => {
+    const errors = [];
+    const files = [
+        {
+            path: "src/new.ts",
+            oldPath: "src/old.ts",
+            status: "renamed",
+        },
+        {path: "README.md", status: "modified"},
+        {path: "deleted-only.ts", status: "modified"},
+    ];
+    const comments = [
+        {
+            id: 1,
+            deleted: true,
+            inline: {path: "src/old.ts", from: 4},
+        },
+        {id: 2, parent: {id: 1}, content: {raw: "Kept reply"}},
+        {
+            id: 3,
+            deleted: true,
+            inline: {path: "deleted-only.ts", to: 2},
+        },
+        {id: 4, content: {raw: "General comment"}},
+    ];
+    const {PullRequestTreeProvider, PullRequestNode} = treeModule.exports;
+    const provider = new PullRequestTreeProvider(
+        () => ({
+            getChangedFiles: async () => files,
+            getComments: async () => comments,
+            getFileConflicts: async () => [],
+        }),
+        () => repository,
+        (error) => errors.push(error),
+    );
+    provider.setFileLayout("list");
+    const nodes = await provider.getChildren(
+        new PullRequestNode({
+            id: 8,
+            title: "PR 8",
+            state: "OPEN",
+            source: {branch: {name: "feature"}},
+            destination: {branch: {name: "main"}},
+        }),
+    );
+    const renamed = nodes.find((node) => node.label === "new.ts");
+    const readme = nodes.find((node) => node.label === "README.md");
+    const deletedOnly = nodes.find((node) => node.label === "deleted-only.ts");
+
+    assert.equal(renamed.iconPath.id, "comment-discussion");
+    assert.match(renamed.tooltip, /Has comments/);
+    assert.match(renamed.accessibilityInformation.label, /has comments/);
+    assert.equal(readme.iconPath, "file");
+    assert.equal(deletedOnly.iconPath, "file");
+    assert.deepEqual(errors, []);
+    provider.dispose();
+});
+
 test("keeps changed files visible when conflict detection fails and skips closed PRs", async () => {
     const errors = [];
     const conflictCalls = [];
@@ -210,6 +269,7 @@ test("keeps changed files visible when conflict detection fails and skips closed
     const provider = new PullRequestTreeProvider(
         () => ({
             getChangedFiles: async () => [{path: "README.md", status: "modified"}],
+            getComments: async () => [],
             getFileConflicts: async (_repository, id) => {
                 conflictCalls.push(id);
                 throw new Error("Conflicts unavailable");

@@ -1,10 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const {JiraClient} = require("../dist/jira/client");
 const {buildFileTree} = require("../dist/bitbucket/tree");
 const {BitbucketClient} = require("../dist/bitbucket/client");
-const {markConflictedFiles} = require("../dist/bitbucket/conflicts");
-const {JiraClient} = require("../dist/jira/client");
 const {extractJiraIssueKeys} = require("../dist/jira/issues");
+const {markConflictedFiles} = require("../dist/bitbucket/conflicts");
 const {parseBitbucketRemoteUrl} = require("../dist/bitbucket/repository");
 const {renderMarkdown, sanitizeCommentHtml} = require("../dist/views/markdown");
 
@@ -689,7 +689,10 @@ test("nested changed files open a diff for their original repository and PR", as
     const file = {path: "src/nested/new.ts", oldPath: "src/old.ts", status: "renamed"};
     let selectedRepository = repository;
     const provider = new PullRequestTreeProvider(
-        () => ({getChangedFiles: async () => [file]}),
+        () => ({
+            getChangedFiles: async () => [file],
+            getComments: async () => [],
+        }),
         () => selectedRepository,
         (error) => {
             throw error;
